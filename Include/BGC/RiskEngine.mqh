@@ -184,11 +184,15 @@ public:
    bool CheckAgeLimit()
    {
       if(!m_cycle_running || m_cycle_start == 0) return false;
-      if(GetPositionCount() == 0) return false;
+      // Fire on positions OR pending orders — original bug was checking positions only,
+      // which meant a cycle with only pending orders (positions closed at individual TP)
+      // would never be killed by the age limit.
+      if(GetPositionCount() == 0 && GetPendingOrderCount() == 0) return false;
       datetime elapsed = TimeCurrent() - m_cycle_start;
       if(elapsed >= (datetime)m_age_limit_sec)
       {
-         PrintFormat("RiskEngine: AgeLimit hit — %d sec elapsed", (int)elapsed);
+         PrintFormat("RiskEngine: AgeLimit hit — %d sec elapsed | pos=%d pend=%d",
+                     (int)elapsed, GetPositionCount(), GetPendingOrderCount());
          return LiquidateCycle("AgeLimit");
       }
       return false;
@@ -209,6 +213,17 @@ public:
       {
          if(!m_pos.SelectByIndex(i)) continue;
          if(m_pos.Symbol() == m_symbol && m_pos.Magic() == (ulong)m_magic) cnt++;
+      }
+      return cnt;
+   }
+
+   int GetPendingOrderCount()
+   {
+      int cnt = 0;
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      {
+         if(!m_ord.SelectByIndex(i)) continue;
+         if(m_ord.Symbol() == m_symbol && m_ord.Magic() == (ulong)m_magic) cnt++;
       }
       return cnt;
    }
