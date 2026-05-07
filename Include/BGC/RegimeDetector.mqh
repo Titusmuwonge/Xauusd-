@@ -1,9 +1,8 @@
 //+------------------------------------------------------------------+
 //| RegimeDetector.mqh — CUSUM-based Market Regime Classifier        |
-//| Detects RANGING vs TRENDING states via cumulative-sum statistics  |
-//| and measures price deviation from a rolling EMA+StdDev envelope. |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef BGC_REGIME_DETECTOR_MQH
+#define BGC_REGIME_DETECTOR_MQH
 
 enum ENUM_MARKET_REGIME
 {
@@ -15,33 +14,28 @@ enum ENUM_MARKET_REGIME
 class CRegimeDetector
 {
 private:
-   //--- indicator handles
    int    m_ema_handle;
    int    m_atr_handle;
 
-   //--- configuration
    string          m_symbol;
    ENUM_TIMEFRAMES m_tf;
    int             m_ema_period;
    int             m_atr_period;
-   double          m_cusum_threshold;   // h — detection threshold (sigma multiples)
-   double          m_cusum_allowance;   // k — slack allowance (typically 0.5)
-   double          m_dev_sigma;         // signal trigger in std-dev units
+   double          m_cusum_threshold;
+   double          m_cusum_allowance;
+   double          m_dev_sigma;
 
-   //--- CUSUM state
    double m_cusum_pos;
    double m_cusum_neg;
 
-   //--- rolling std-dev window (same length as EMA)
    double m_price_buf[20];
    int    m_buf_pos;
    int    m_buf_count;
 
-   //--- cached outputs
-   double              m_atr;
-   double              m_ema;
-   double              m_std;
-   ENUM_MARKET_REGIME  m_regime;
+   double             m_atr;
+   double             m_ema;
+   double             m_std;
+   ENUM_MARKET_REGIME m_regime;
 
    //--------------------------------------------------------------------
    double RollingStd(double new_price)
@@ -49,12 +43,15 @@ private:
       m_price_buf[m_buf_pos % m_ema_period] = new_price;
       m_buf_pos++;
       if(m_buf_count < m_ema_period) m_buf_count++;
-
       if(m_buf_count < 2) return 1e-10;
 
       double sum = 0.0, sumsq = 0.0;
       int n = m_buf_count;
-      for(int i = 0; i < n; i++) { sum += m_price_buf[i]; sumsq += m_price_buf[i] * m_price_buf[i]; }
+      for(int i = 0; i < n; i++)
+      {
+         sum   += m_price_buf[i];
+         sumsq += m_price_buf[i] * m_price_buf[i];
+      }
       double mean = sum / n;
       double var  = (sumsq / n) - mean * mean;
       return (var > 0.0) ? MathSqrt(var) : 1e-10;
@@ -63,7 +60,6 @@ private:
    //--------------------------------------------------------------------
    void UpdateCUSUM(double z_score)
    {
-      // Page's CUSUM: accumulates standardised innovation above/below k
       m_cusum_pos = MathMax(0.0, m_cusum_pos + z_score - m_cusum_allowance);
       m_cusum_neg = MathMax(0.0, m_cusum_neg - z_score - m_cusum_allowance);
    }
@@ -86,13 +82,13 @@ public:
              double cusum_allowance = 0.5,
              double dev_sigma       = 2.0)
    {
-      m_symbol           = symbol;
-      m_tf               = tf;
-      m_ema_period       = MathMax(2, ema_period);
-      m_atr_period       = MathMax(1, atr_period);
-      m_cusum_threshold  = cusum_threshold;
-      m_cusum_allowance  = cusum_allowance;
-      m_dev_sigma        = dev_sigma;
+      m_symbol          = symbol;
+      m_tf              = tf;
+      m_ema_period      = MathMax(2, ema_period);
+      m_atr_period      = MathMax(1, atr_period);
+      m_cusum_threshold = cusum_threshold;
+      m_cusum_allowance = cusum_allowance;
+      m_dev_sigma       = dev_sigma;
 
       ArrayInitialize(m_price_buf, 0.0);
 
@@ -118,7 +114,6 @@ public:
    bool Update()
    {
       double ema_buf[2], atr_buf[2];
-
       if(CopyBuffer(m_ema_handle, 0, 0, 2, ema_buf) < 2) return false;
       if(CopyBuffer(m_atr_handle, 0, 0, 2, atr_buf) < 2) return false;
 
@@ -131,26 +126,17 @@ public:
       double z = (m_std > 1e-10) ? (price - m_ema) / m_std : 0.0;
       UpdateCUSUM(z);
 
-      // Classify regime
       if(m_cusum_pos >= m_cusum_threshold)
-      {
          m_regime = REGIME_TRENDING_UP;
-      }
       else if(m_cusum_neg >= m_cusum_threshold)
-      {
          m_regime = REGIME_TRENDING_DOWN;
-      }
       else
-      {
          m_regime = REGIME_RANGING;
-      }
 
       return true;
    }
 
    //--------------------------------------------------------------------
-   // Returns true when price is 'sigma' std-devs from EMA.
-   // direction: +1 = overextended above (sell signal), -1 = below (buy signal)
    bool IsPriceExtended(double price, int &direction)
    {
       if(m_std < 1e-10) return false;
@@ -162,7 +148,6 @@ public:
    }
 
    //--------------------------------------------------------------------
-   // Hard reset of CUSUM accumulators — call after a cycle close
    void Reset()
    {
       m_cusum_pos = 0.0;
@@ -170,11 +155,13 @@ public:
       m_regime    = REGIME_RANGING;
    }
 
-   //--- accessors
-   ENUM_MARKET_REGIME GetRegime()   const { return m_regime; }
-   double             GetATR()      const { return m_atr; }
-   double             GetEMA()      const { return m_ema; }
-   double             GetStdDev()   const { return m_std; }
-   double             GetCUSUMPos() const { return m_cusum_pos; }
-   double             GetCUSUMNeg() const { return m_cusum_neg; }
+   //--- accessors (MQL5 does not support const member functions)
+   ENUM_MARKET_REGIME GetRegime()   { return m_regime;    }
+   double             GetATR()      { return m_atr;       }
+   double             GetEMA()      { return m_ema;       }
+   double             GetStdDev()   { return m_std;       }
+   double             GetCUSUMPos() { return m_cusum_pos; }
+   double             GetCUSUMNeg() { return m_cusum_neg; }
 };
+
+#endif // BGC_REGIME_DETECTOR_MQH
