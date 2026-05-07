@@ -47,10 +47,11 @@ CRegimeDetector g_regime;
 CGridManager    g_grid;
 CRiskEngine     g_risk;
 
-string   g_symbol;
-bool     g_initialized    = false;
-datetime g_last_bar_time  = 0;
-datetime g_last_news_warn = 0;   // throttle for news-filter log message
+string             g_symbol;
+bool               g_initialized    = false;
+datetime           g_last_bar_time  = 0;
+datetime           g_last_news_warn = 0;
+ENUM_MARKET_REGIME g_prev_regime    = REGIME_RANGING;  // regime transition tracker
 
 //+------------------------------------------------------------------+
 //|  Helpers                                                           |
@@ -116,6 +117,7 @@ int OnInit()
    g_initialized   = true;
    g_last_bar_time = 0;
    g_last_news_warn= 0;
+   g_prev_regime   = REGIME_RANGING;
 
    PrintFormat("BGC Grid READY | Symbol=%s TF=%s Magic=%d Lot=%.2f Levels=%d",
                g_symbol, EnumToString(InpTF), InpMagic, adj_lot, InpMaxLevels);
@@ -182,6 +184,27 @@ void OnTick()
    if(bid <= 0.0 || ask <= 0.0) return;
 
    ENUM_MARKET_REGIME regime = g_regime.GetRegime();
+
+   //--- 6a. Regime-change guard — cancel ALL stale orders on every transition
+   //        Fixes TGT→RANGING gap where old buy/sell stops were left orphaned
+   if(regime != g_prev_regime)
+   {
+      string prev_str = (g_prev_regime == REGIME_RANGING)      ? "RANGING" :
+                        (g_prev_regime == REGIME_TRENDING_UP)   ? "TGT_UP"  : "TGT_DN";
+      string curr_str = (regime == REGIME_RANGING)             ? "RANGING" :
+                        (regime == REGIME_TRENDING_UP)          ? "TGT_UP"  : "TGT_DN";
+      PrintFormat("BGC Grid: Regime %s → %s | cancelling stale pending orders", prev_str, curr_str);
+      g_grid.CancelAllPendingOrders();
+
+      // On TGT→RANGING with no open positions: full cycle reset for a clean slate
+      if(regime == REGIME_RANGING && g_risk.GetPositionCount() == 0)
+      {
+         g_risk.StopCycle();
+         g_grid.Deactivate();
+         g_regime.Reset();
+      }
+      g_prev_regime = regime;
+   }
 
    //--- 6. Regime-based grid management
    if(regime == REGIME_RANGING)
