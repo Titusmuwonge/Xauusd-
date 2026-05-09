@@ -18,18 +18,20 @@ private:
    string m_symbol;
    int    m_magic;
    int    m_slippage_pts;
+   int    m_digits;
 
    double   m_basket_tp_pct;
    double   m_basket_sl_pct;
    int      m_age_limit_sec;
    int      m_news_buffer_sec;
    bool     m_news_filter_on;
+   bool     m_news_warn_logged;
 
    datetime m_cycle_start;
    bool     m_cycle_running;
 
    //--------------------------------------------------------------------
-   double GetAccountBalance() { return AccountInfoDouble(ACCOUNT_BALANCE); }
+   double GetAccountEquity() { return AccountInfoDouble(ACCOUNT_EQUITY); }
 
    //--------------------------------------------------------------------
    double CalcTotalFloatingPL()
@@ -97,6 +99,15 @@ private:
 
       MqlCalendarValue vals[];
       int count = CalendarValueHistory(vals, from, to, "USD", NULL);
+      if(count < 0)
+      {
+         if(!m_news_warn_logged)
+         {
+            Print("RiskEngine: CalendarValueHistory unavailable — news filter disabled");
+            m_news_warn_logged = true;
+         }
+         return false;
+      }
       for(int i = 0; i < count; i++)
       {
          MqlCalendarEvent evt;
@@ -107,12 +118,12 @@ private:
    }
 
 public:
-   CRiskEngine() : m_cycle_start(0), m_cycle_running(false) {}
+   CRiskEngine() : m_cycle_start(0), m_cycle_running(false), m_news_warn_logged(false) {}
    ~CRiskEngine() {}
 
    //--------------------------------------------------------------------
    bool Init(string symbol, int magic,
-             double basket_tp_pct   = 0.5,
+             double basket_tp_pct   = 1.5,
              double basket_sl_pct   = 2.0,
              int    age_limit_hours = 4,
              bool   news_filter     = true,
@@ -127,6 +138,7 @@ public:
       m_news_filter_on  = news_filter;
       m_news_buffer_sec = news_buffer_min * 60;
       m_slippage_pts    = slippage_pts;
+      m_digits          = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
       m_trade.SetExpertMagicNumber((ulong)magic);
       m_trade.SetDeviationInPoints((ulong)slippage_pts);
@@ -154,8 +166,8 @@ public:
    bool CheckBasketTP()
    {
       if(GetPositionCount() == 0) return false;
-      double balance   = GetAccountBalance();
-      double threshold = balance * (m_basket_tp_pct / 100.0);
+      double equity    = GetAccountEquity();
+      double threshold = equity * (m_basket_tp_pct / 100.0);
       double total_pl  = CalcTotalFloatingPL();
       if(total_pl >= threshold)
       {
@@ -169,8 +181,8 @@ public:
    bool CheckBasketSL()
    {
       if(GetPositionCount() == 0) return false;
-      double balance   = GetAccountBalance();
-      double threshold = -balance * (m_basket_sl_pct / 100.0);
+      double equity    = GetAccountEquity();
+      double threshold = -equity * (m_basket_sl_pct / 100.0);
       double total_pl  = CalcTotalFloatingPL();
       if(total_pl <= threshold)
       {
@@ -184,9 +196,6 @@ public:
    bool CheckAgeLimit()
    {
       if(!m_cycle_running || m_cycle_start == 0) return false;
-      // Fire on positions OR pending orders — original bug was checking positions only,
-      // which meant a cycle with only pending orders (positions closed at individual TP)
-      // would never be killed by the age limit.
       if(GetPositionCount() == 0 && GetPendingOrderCount() == 0) return false;
       datetime elapsed = TimeCurrent() - m_cycle_start;
       if(elapsed >= (datetime)m_age_limit_sec)
@@ -196,6 +205,94 @@ public:
          return LiquidateCycle("AgeLimit");
       }
       return false;
+   }
+
+   //--------------------------------------------------------------------
+   // Move SL to break-even once price has moved break_even_atr_mult × ATR in our favour.
+   bool CheckBreakEven(double atr, double break_even_atr_mult)
+   {
+      if(atr <= 0.0 || break_even_atr_mult <= 0.0) return false;
+      double bid      = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      double ask      = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      double tick     = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tick <= 0.0) tick = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double threshold = atr * break_even_atr_mult;
+      bool any = false;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(!m_pos.SelectByIndex(i)) continue;
+         if(m_pos.Symbol() != m_symbol || m_pos.Magic() != (ulong)m_magic) continue;
+
+         double entry      = m_pos.PriceOpen();
+         double current_sl = m_pos.StopLoss();
+
+         if(m_pos.PositionType() == POSITION_TYPE_BUY)
+         {
+            double be_sl = NormalizeDouble(entry + tick, m_digits);
+            if(bid - entry >= threshold && (current_sl == 0.0 || current_sl < be_sl))
+            {
+               if(m_trade.PositionModify(m_pos.Ticket(), be_sl, m_pos.TakeProfit()))
+                  any = true;
+            }
+         }
+         else
+         {
+            double be_sl = NormalizeDouble(entry - tick, m_digits);
+            if(entry - ask >= threshold && (current_sl == 0.0 || current_sl > be_sl))
+            {
+               if(m_trade.PositionModify(m_pos.Ticket(), be_sl, m_pos.TakeProfit()))
+                  any = true;
+            }
+         }
+      }
+      return any;
+   }
+
+   //--------------------------------------------------------------------
+   // Trail SL at trail_atr_mult × ATR behind current price once profit ≥ 1×ATR.
+   bool CheckTrailingStop(double atr, double trail_atr_mult)
+   {
+      if(atr <= 0.0 || trail_atr_mult <= 0.0) return false;
+      double bid       = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      double ask       = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      double trail_gap = atr * trail_atr_mult;
+      bool any = false;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(!m_pos.SelectByIndex(i)) continue;
+         if(m_pos.Symbol() != m_symbol || m_pos.Magic() != (ulong)m_magic) continue;
+
+         double entry      = m_pos.PriceOpen();
+         double current_sl = m_pos.StopLoss();
+
+         if(m_pos.PositionType() == POSITION_TYPE_BUY)
+         {
+            if(bid - entry >= atr)  // profit threshold: 1×ATR before trailing begins
+            {
+               double new_sl = NormalizeDouble(bid - trail_gap, m_digits);
+               if(new_sl > current_sl)
+               {
+                  if(m_trade.PositionModify(m_pos.Ticket(), new_sl, m_pos.TakeProfit()))
+                     any = true;
+               }
+            }
+         }
+         else
+         {
+            if(entry - ask >= atr)  // profit threshold: 1×ATR before trailing begins
+            {
+               double new_sl = NormalizeDouble(ask + trail_gap, m_digits);
+               if(current_sl == 0.0 || new_sl < current_sl)
+               {
+                  if(m_trade.PositionModify(m_pos.Ticket(), new_sl, m_pos.TakeProfit()))
+                     any = true;
+               }
+            }
+         }
+      }
+      return any;
    }
 
    //--------------------------------------------------------------------
@@ -229,7 +326,7 @@ public:
    }
 
    double GetTotalPL()  { return CalcTotalFloatingPL(); }
-   double GetBalance()  { return GetAccountBalance();   }
+   double GetEquity()   { return GetAccountEquity();    }
 };
 
 #endif // BGC_RISK_ENGINE_MQH

@@ -118,11 +118,11 @@ def run_optimisation(df: pd.DataFrame):
     print("═"*55)
 
     param_grid = {
-        "cusum_threshold": [3.0, 4.0, 5.0, 6.0],
+        "cusum_threshold": [2.0, 2.5, 3.0, 4.0],   # lowered from [3–6] — catch trends earlier
         "dev_sigma":       [1.5, 2.0, 2.5, 3.0],
-        "grid_atr_mult":   [0.3, 0.5, 0.7, 1.0],
+        "grid_atr_mult":   [0.5, 0.7, 1.0, 1.5],   # tighter to wider spacing
         "max_levels":      [2, 3, 4],
-        "basket_tp_pct":   [0.3, 0.5, 0.75, 1.0],
+        "basket_tp_pct":   [1.0, 1.5, 2.0, 2.5],   # raised from [0.3–1.0] — near 1:1 vs SL
         "tp_atr_mult":     [0.5, 1.0, 1.5],
     }
 

@@ -28,7 +28,7 @@ private:
    double m_cusum_pos;
    double m_cusum_neg;
 
-   double m_price_buf[20];
+   double m_price_buf[];
    int    m_buf_pos;
    int    m_buf_count;
 
@@ -78,7 +78,7 @@ public:
    bool Init(string symbol, ENUM_TIMEFRAMES tf,
              int    ema_period      = 20,
              int    atr_period      = 14,
-             double cusum_threshold = 4.0,
+             double cusum_threshold = 2.5,
              double cusum_allowance = 0.5,
              double dev_sigma       = 2.0)
    {
@@ -90,6 +90,7 @@ public:
       m_cusum_allowance = cusum_allowance;
       m_dev_sigma       = dev_sigma;
 
+      ArrayResize(m_price_buf, m_ema_period);
       ArrayInitialize(m_price_buf, 0.0);
 
       m_ema_handle = iMA(symbol, tf, m_ema_period, 0, MODE_EMA, PRICE_CLOSE);
@@ -130,8 +131,9 @@ public:
          m_regime = REGIME_TRENDING_UP;
       else if(m_cusum_neg >= m_cusum_threshold)
          m_regime = REGIME_TRENDING_DOWN;
-      else
+      else if(m_cusum_pos < 1.0 && m_cusum_neg < 1.0)
          m_regime = REGIME_RANGING;
+      // else: hysteresis — keep previous regime until both CUSUM values settle below 1.0
 
       return true;
    }

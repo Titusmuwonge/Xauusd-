@@ -4,7 +4,7 @@
 //| XAU/USD · MQL5 · MT5 Strategy Tester Compatible                  |
 //+------------------------------------------------------------------+
 #property copyright   "BGC Grid EA — XAU/USD"
-#property version     "2.01"
+#property version     "3.00"
 #property description "Regime-Aware Mean-Reversion / Trend Grid for Gold"
 #property strict
 
@@ -21,22 +21,28 @@ input ENUM_TIMEFRAMES InpTF             = PERIOD_M15;   // Working timeframe
 
 input int    InpEMAPeriod      = 20;     // EMA period
 input int    InpATRPeriod      = 14;     // ATR period
-input double InpCUSUMThreshold = 4.0;   // CUSUM breakout threshold
+input double InpCUSUMThreshold = 2.5;   // CUSUM breakout threshold
 input double InpCUSUMAllowance = 0.5;   // CUSUM allowance k
 input double InpDevSigma       = 2.0;   // Std-dev extension trigger
 
-input double InpLotSize        = 0.01;  // Lot size per grid level
+input double InpRiskPct        = 1.0;   // Risk % of equity per grid level (0 = use InpLotSize)
+input double InpLotSize        = 0.01;  // Fixed lot size (used when InpRiskPct = 0)
 input int    InpMaxLevels      = 4;     // Max grid levels per side
-input double InpGridATRMult    = 0.5;   // Grid spacing = ATR x this
-input double InpTPATRMult      = 1.0;   // Per-order TP (0 = basket only)
+input double InpGridATRMult    = 0.7;   // Grid spacing = ATR x this
+input double InpTPATRMult      = 1.0;   // Per-order TP for MGT mode (0 = basket only)
 input int    InpSlippagePts    = 30;    // Max slippage in points
 
-input double InpBasketTPPct    = 0.50;  // Basket TP as % of balance
-input double InpBasketSLPct    = 2.00;  // Hard SL as % of balance
+input double InpBasketTPPct    = 1.50;  // Basket TP as % of equity
+input double InpBasketSLPct    = 2.00;  // Hard SL as % of equity
 input int    InpAgeLimitHours  = 4;     // Max cycle age (hours)
 
 input bool   InpNewsFilter     = true;  // Enable high-impact news filter
 input int    InpNewsBufferMin  = 30;    // Minutes before/after news event
+
+input bool   InpSessionFilter  = true;  // Block new orders during Asian session (22:00–01:00)
+
+input double InpBreakEvenATR   = 0.5;  // Move SL to break-even after N×ATR profit
+input double InpTrailATR       = 0.5;  // Trail SL distance in ATR (activates after 1×ATR profit)
 
 input int    InpMagic          = 20260505; // EA magic number
 
@@ -51,7 +57,8 @@ string             g_symbol;
 bool               g_initialized    = false;
 datetime           g_last_bar_time  = 0;
 datetime           g_last_news_warn = 0;
-ENUM_MARKET_REGIME g_prev_regime    = REGIME_RANGING;  // regime transition tracker
+double             g_last_atr       = 0.0;
+ENUM_MARKET_REGIME g_prev_regime    = REGIME_RANGING;
 
 //+------------------------------------------------------------------+
 //|  Helpers                                                           |
@@ -73,6 +80,31 @@ bool IsNewBar()
    return true;
 }
 
+bool IsAsianSession()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.hour >= 22 || dt.hour < 1);
+}
+
+double CalcDynamicLot(double atr)
+{
+   double equity        = AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk_amount   = equity * (InpRiskPct / 100.0);
+   double contract_size = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double sl_value      = atr * contract_size;  // $ loss per lot at 1×ATR SL
+   if(sl_value <= 0.0) return SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+
+   double lot      = risk_amount / sl_value;
+   double min_lot  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(min_lot, MathMin(max_lot, lot));
+   lot = MathRound(lot / lot_step) * lot_step;
+   return lot;
+}
+
 //+------------------------------------------------------------------+
 //|  OnInit                                                            |
 //+------------------------------------------------------------------+
@@ -80,14 +112,13 @@ int OnInit()
 {
    g_symbol = (InpSymbol == "" || InpSymbol == NULL) ? _Symbol : InpSymbol;
 
-   // Warn if symbol doesn't look like gold
    string sym_upper = g_symbol;
    StringToUpper(sym_upper);
    if(StringFind(sym_upper, "XAU") < 0 && StringFind(sym_upper, "GOL") < 0)
       PrintFormat("BGC Grid: WARNING — symbol '%s' may not be XAU/USD.", g_symbol);
 
-   if(InpLotSize <= 0.0)
-   { Print("BGC Grid: InpLotSize must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpRiskPct <= 0.0 && InpLotSize <= 0.0)
+   { Print("BGC Grid: InpRiskPct or InpLotSize must be > 0"); return INIT_PARAMETERS_INCORRECT; }
    if(InpMaxLevels < 1)
    { Print("BGC Grid: InpMaxLevels must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
    if(InpBasketTPPct <= 0.0)
@@ -95,12 +126,17 @@ int OnInit()
 
    double min_lot  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
    double lot_step = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
-   if(InpLotSize < min_lot)
+
+   // Determine starting lot — dynamic sizing replaces this each cycle
+   double adj_lot = (InpRiskPct > 0.0)
+                    ? MathMax(min_lot, MathRound(min_lot / lot_step) * lot_step)
+                    : MathMax(min_lot, MathRound(InpLotSize / lot_step) * lot_step);
+
+   if(InpRiskPct <= 0.0 && adj_lot < min_lot)
    {
       PrintFormat("BGC Grid: InpLotSize %.2f below broker min %.2f", InpLotSize, min_lot);
       return INIT_PARAMETERS_INCORRECT;
    }
-   double adj_lot = MathRound(InpLotSize / lot_step) * lot_step;
 
    if(!g_regime.Init(g_symbol, InpTF, InpEMAPeriod, InpATRPeriod,
                      InpCUSUMThreshold, InpCUSUMAllowance, InpDevSigma))
@@ -117,10 +153,13 @@ int OnInit()
    g_initialized   = true;
    g_last_bar_time = 0;
    g_last_news_warn= 0;
+   g_last_atr      = 0.0;
    g_prev_regime   = REGIME_RANGING;
 
-   PrintFormat("BGC Grid READY | Symbol=%s TF=%s Magic=%d Lot=%.2f Levels=%d",
-               g_symbol, EnumToString(InpTF), InpMagic, adj_lot, InpMaxLevels);
+   PrintFormat("BGC Grid READY | Symbol=%s TF=%s Magic=%d RiskPct=%.1f%% Levels=%d "
+               "BasketTP=%.1f%% BasketSL=%.1f%%",
+               g_symbol, EnumToString(InpTF), InpMagic, InpRiskPct, InpMaxLevels,
+               InpBasketTPPct, InpBasketSLPct);
    return INIT_SUCCEEDED;
 }
 
@@ -169,6 +208,13 @@ void OnTick()
       return;
    }
 
+   //--- 3b. Break-even and trailing stop — every tick using cached ATR
+   if(g_last_atr > 0.0 && g_risk.GetPositionCount() > 0)
+   {
+      if(InpBreakEvenATR > 0.0) g_risk.CheckBreakEven(g_last_atr, InpBreakEvenATR);
+      if(InpTrailATR     > 0.0) g_risk.CheckTrailingStop(g_last_atr, InpTrailATR);
+   }
+
    //--- 4. New-bar gate for grid placement
    if(!IsNewBar()) return;
 
@@ -179,6 +225,8 @@ void OnTick()
    double ema = g_regime.GetEMA();
    if(atr <= 0.0) return;
 
+   g_last_atr = atr;  // cache for break-even/trail on every tick
+
    double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
    if(bid <= 0.0 || ask <= 0.0) return;
@@ -186,7 +234,6 @@ void OnTick()
    ENUM_MARKET_REGIME regime = g_regime.GetRegime();
 
    //--- 6a. Regime-change guard — cancel ALL stale orders on every transition
-   //        Fixes TGT→RANGING gap where old buy/sell stops were left orphaned
    if(regime != g_prev_regime)
    {
       string prev_str = (g_prev_regime == REGIME_RANGING)      ? "RANGING" :
@@ -196,7 +243,6 @@ void OnTick()
       PrintFormat("BGC Grid: Regime %s → %s | cancelling stale pending orders", prev_str, curr_str);
       g_grid.CancelAllPendingOrders();
 
-      // On TGT→RANGING with no open positions: full cycle reset for a clean slate
       if(regime == REGIME_RANGING && g_risk.GetPositionCount() == 0)
       {
          g_risk.StopCycle();
@@ -206,19 +252,27 @@ void OnTick()
       g_prev_regime = regime;
    }
 
-   //--- 6. Regime-based grid management
+   //--- 6b. Session filter — suppress new grid placement during Asian session
+   if(InpSessionFilter && IsAsianSession())
+      return;
+
+   //--- 6c. Dynamic lot sizing — recalculate each bar
+   if(InpRiskPct > 0.0)
+   {
+      double dyn_lot = CalcDynamicLot(atr);
+      if(dyn_lot > 0.0) g_grid.SetLotSize(dyn_lot);
+   }
+
+   //--- 7. Regime-based grid management
    if(regime == REGIME_RANGING)
    {
       int ext_dir = 0;
       if(g_regime.IsPriceExtended((bid + ask) * 0.5, ext_dir))
       {
          if(!g_risk.IsCycleRunning())
-         {
-            g_risk.StartCycle();
-            PrintFormat("BGC Grid: NEW CYCLE MGT | ATR=%.2f EMA=%.2f CS+/−=%.2f/%.2f",
-                        atr, ema, g_regime.GetCUSUMPos(), g_regime.GetCUSUMNeg());
-         }
-         g_grid.ManageMGTGrid(bid, ask, ema, atr);
+            PrintFormat("BGC Grid: NEW CYCLE MGT | ATR=%.2f EMA=%.2f ext=%+d CS+/−=%.2f/%.2f",
+                        atr, ema, ext_dir, g_regime.GetCUSUMPos(), g_regime.GetCUSUMNeg());
+         g_grid.ManageMGTGrid(bid, ask, ema, atr, ext_dir);
       }
    }
    else
@@ -227,16 +281,13 @@ void OnTick()
       g_grid.CancelAllPendingOrders();
 
       if(!g_risk.IsCycleRunning())
-      {
-         g_risk.StartCycle();
          PrintFormat("BGC Grid: NEW CYCLE TGT | dir=%s ATR=%.2f CS+/−=%.2f/%.2f",
                      (direction > 0 ? "UP" : "DOWN"), atr,
                      g_regime.GetCUSUMPos(), g_regime.GetCUSUMNeg());
-      }
       g_grid.ManageTGTGrid(bid, ask, atr, direction);
    }
 
-   //--- 7. Cycle cleanup when all positions and orders are gone
+   //--- 8. Cycle cleanup when all positions and orders are gone
    if(g_risk.GetPositionCount() == 0 && g_grid.GetPendingOrderCount() == 0)
    {
       if(g_risk.IsCycleRunning())
@@ -255,7 +306,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeResult      &request,
                         const MqlTradeResult      &result)
 {
-   // Start cycle timer on first fill if not already running
+   // Start cycle timer only on the first real fill — not on pending placement
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && !g_risk.IsCycleRunning())
       g_risk.StartCycle();
 }

@@ -58,17 +58,17 @@ class BacktestParams:
     # Regime detection
     ema_period:       int   = 20
     atr_period:       int   = 14
-    cusum_threshold:  float = 4.0
+    cusum_threshold:  float = 2.5
     cusum_allowance:  float = 0.5
     dev_sigma:        float = 2.0
     # Grid
     lot_size:         float = 0.01
     max_levels:       int   = 4
-    grid_atr_mult:    float = 0.5
+    grid_atr_mult:    float = 0.7
     tp_atr_mult:      float = 1.0
     spread_pts:       float = 30.0   # typical XAUUSD spread in pts (0.30 USD)
     # Risk
-    basket_tp_pct:    float = 0.50
+    basket_tp_pct:    float = 1.50
     basket_sl_pct:    float = 2.00
     age_limit_hours:  int   = 4
     # Account
@@ -111,14 +111,16 @@ def calc_indicators(df: pd.DataFrame, p: BacktestParams) -> pd.DataFrame:
     d["cusum_pos"] = cusum_pos
     d["cusum_neg"] = cusum_neg
 
-    # Regime classification
+    # Regime classification with hysteresis:
+    # Only return to RANGING when both CUSUM values drop below 1.0.
     h = p.cusum_threshold
-    conds = [
-        cusum_pos >= h,
-        cusum_neg >= h,
-    ]
-    choices = [int(Regime.TRENDING_UP), int(Regime.TRENDING_DOWN)]
-    d["regime"] = np.select(conds, choices, default=int(Regime.RANGING))
+    regime_arr = np.where(cusum_pos >= h, int(Regime.TRENDING_UP),
+                 np.where(cusum_neg >= h, int(Regime.TRENDING_DOWN), int(Regime.RANGING)))
+    for i in range(1, len(regime_arr)):
+        if regime_arr[i] == int(Regime.RANGING) and regime_arr[i-1] != int(Regime.RANGING):
+            if cusum_pos[i] >= 1.0 or cusum_neg[i] >= 1.0:
+                regime_arr[i] = regime_arr[i-1]  # hold previous trend during transition
+    d["regime"] = regime_arr
 
     # Price extension flag
     d["ext_dir"] = np.where(d["z"] >=  p.dev_sigma,  1,
@@ -179,37 +181,38 @@ class BGCBacktest:
         self.orders.append(o)
 
     # ── Grid builders ───────────────────────────────────────────
-    def _mgt_grid(self, mid: float, atr: float, ts: pd.Timestamp):
+    def _mgt_grid(self, mid: float, atr: float, ext_dir: int, ts: pd.Timestamp):
         spacing = atr * self.p.grid_atr_mult
         tp_dist = atr * self.p.tp_atr_mult if self.p.tp_atr_mult > 0 else 0
 
         n = min(self.p.max_levels, 4)
         for i in range(1, n + 1):
-            sp = mid + i * spacing
-            sl = sp + atr * 2.0
-            tp = sp - tp_dist if tp_dist else 0.0
-            self._place(OrderType.SELL_LIMIT, sp, sl, tp, spacing, ts)
-
-            bp = mid - i * spacing
-            sl = bp - atr * 2.0
-            tp = bp + tp_dist if tp_dist else 0.0
-            self._place(OrderType.BUY_LIMIT, bp, sl, tp, spacing, ts)
+            if ext_dir > 0:  # price above EMA — sell limits for mean reversion
+                sp = mid + i * spacing
+                sl = sp + atr * 1.0  # 1:1 RR (was 2.0)
+                tp = sp - tp_dist if tp_dist else 0.0
+                self._place(OrderType.SELL_LIMIT, sp, sl, tp, spacing, ts)
+            else:  # price below EMA — buy limits for mean reversion
+                bp = mid - i * spacing
+                sl = bp - atr * 1.0  # 1:1 RR (was 2.0)
+                tp = bp + tp_dist if tp_dist else 0.0
+                self._place(OrderType.BUY_LIMIT, bp, sl, tp, spacing, ts)
 
     def _tgt_grid(self, mid: float, atr: float, direction: int, ts: pd.Timestamp):
         spacing = atr * self.p.grid_atr_mult
-        tp_dist = atr * self.p.tp_atr_mult if self.p.tp_atr_mult > 0 else 0
+        tp_dist = atr * 1.5  # fixed 1:1 RR — 1.5×ATR TP matches 1.5×ATR SL
 
         n = min(self.p.max_levels, 3)
         for i in range(1, n + 1):
             if direction > 0:
                 price = mid + i * spacing
                 sl    = price - atr * 1.5
-                tp    = price + tp_dist if tp_dist else 0.0
+                tp    = price + tp_dist
                 self._place(OrderType.BUY_STOP, price, sl, tp, spacing, ts)
             else:
                 price = mid - i * spacing
                 sl    = price + atr * 1.5
-                tp    = price - tp_dist if tp_dist else 0.0
+                tp    = price - tp_dist
                 self._place(OrderType.SELL_STOP, price, sl, tp, spacing, ts)
 
     # ── Order → Position fill check ─────────────────────────────
@@ -288,33 +291,38 @@ class BGCBacktest:
             self.closed.append(pos)
 
     # ── Liquidate all (basket TP/SL/age) ────────────────────────
-    def _liquidate(self, mid: float, ts: pd.Timestamp, reason: str):
+    def _liquidate(self, row: pd.Series, ts: pd.Timestamp, reason: str):
+        bid = row["close"]
+        ask = row["close"] + self.spread
         self.orders.clear()
         for pos in list(self.positions):
-            pos.exit_price  = mid
+            exit_price = bid if pos.direction > 0 else ask  # long exits at bid, short at ask
+            pos.exit_price  = exit_price
             pos.exit_reason = reason
             pos.closed_at   = ts
-            pos.pnl = self._position_pnl(pos, mid)
+            pos.pnl = self._position_pnl(pos, exit_price)
             self.balance += pos.pnl
             self.closed.append(pos)
         self.positions.clear()
         self.cycle_start = None
 
     # ── Risk guards (every bar) ──────────────────────────────────
-    def _check_risk(self, mid: float, ts: pd.Timestamp) -> bool:
+    def _check_risk(self, row: pd.Series, ts: pd.Timestamp) -> bool:
         if not self.positions and not self.orders:
             return False
 
+        mid       = row["close"]
         float_pnl = self._total_float_pnl(mid)
-        basket_tp  = self.balance * (self.p.basket_tp_pct / 100.0)
-        basket_sl  = -self.balance * (self.p.basket_sl_pct / 100.0)
+        equity    = self.balance + float_pnl  # use equity not balance for thresholds
+        basket_tp = equity * (self.p.basket_tp_pct / 100.0)
+        basket_sl = -equity * (self.p.basket_sl_pct / 100.0)
 
         if self.positions and float_pnl >= basket_tp:
-            self._liquidate(mid, ts, "BasketTP")
+            self._liquidate(row, ts, "BasketTP")
             return True
 
         if self.positions and float_pnl <= basket_sl:
-            self._liquidate(mid, ts, "HardSL")
+            self._liquidate(row, ts, "HardSL")
             return True
 
         # Age limit — fires on positions OR pending orders
@@ -322,7 +330,7 @@ class BGCBacktest:
             elapsed = (ts - self.cycle_start).total_seconds()
             if elapsed >= self.p.age_limit_hours * 3600:
                 if self.positions or self.orders:
-                    self._liquidate(mid, ts, "AgeLimit")
+                    self._liquidate(row, ts, "AgeLimit")
                     self.orders.clear()
                     self.cycle_start = None
                     return True
@@ -345,8 +353,8 @@ class BGCBacktest:
             self._check_fills(row, ts)
             self._check_exits(row, ts)
 
-            # Risk checks every bar
-            if self._check_risk(mid, ts):
+            # Risk checks every bar (pass row so liquidation uses correct bid/ask)
+            if self._check_risk(row, ts):
                 self.prev_regime = reg
                 self.equity_curve.append((ts, self.balance))
                 continue
@@ -358,18 +366,14 @@ class BGCBacktest:
                     self.cycle_start = None
                 self.prev_regime = reg
 
-            # Grid management
+            # Grid management — cycle_start is set only on first FILL (in _check_fills)
             if reg == Regime.RANGING:
                 ext = row["ext_dir"]
                 if ext != 0:
-                    if self.cycle_start is None:
-                        self.cycle_start = ts
-                    self._mgt_grid(mid, atr, ts)
+                    self._mgt_grid(mid, atr, ext, ts)  # directional bias via ext_dir
             else:
                 direction = 1 if reg == Regime.TRENDING_UP else -1
                 self.orders.clear()
-                if self.cycle_start is None:
-                    self.cycle_start = ts
                 self._tgt_grid(mid, atr, direction, ts)
 
             # Natural cycle close

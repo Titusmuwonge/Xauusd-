@@ -129,7 +129,9 @@ public:
    }
 
    //--------------------------------------------------------------------
-   void ManageMGTGrid(double bid, double ask, double ema, double atr)
+   // ext_dir: +1 = price above EMA (place sell limits only)
+   //          -1 = price below EMA (place buy limits only)
+   void ManageMGTGrid(double bid, double ask, double ema, double atr, int ext_dir)
    {
       if(!TradeContextOK()) return;
 
@@ -141,17 +143,22 @@ public:
 
       for(int i = 1; i <= m_max_levels; i++)
       {
-         double sell_price = NormalisePrice(mid + i * m_grid_spacing);
-         double sell_sl    = NormalisePrice(sell_price + atr * 2.0);
-         double sell_tp    = (tp_dist > 0.0) ? NormalisePrice(sell_price - tp_dist) : 0.0;
-         if(!OrderAtLevel(sell_price) && !PositionAtLevel(sell_price))
-            PlaceOrder(ORDER_TYPE_SELL_LIMIT, sell_price, sell_tp, sell_sl);
-
-         double buy_price = NormalisePrice(mid - i * m_grid_spacing);
-         double buy_sl    = NormalisePrice(buy_price - atr * 2.0);
-         double buy_tp    = (tp_dist > 0.0) ? NormalisePrice(buy_price + tp_dist) : 0.0;
-         if(!OrderAtLevel(buy_price) && !PositionAtLevel(buy_price))
-            PlaceOrder(ORDER_TYPE_BUY_LIMIT, buy_price, buy_tp, buy_sl);
+         if(ext_dir > 0)  // price extended above EMA — sell limits for mean reversion
+         {
+            double sell_price = NormalisePrice(mid + i * m_grid_spacing);
+            double sell_sl    = NormalisePrice(sell_price + atr * 1.0);
+            double sell_tp    = (tp_dist > 0.0) ? NormalisePrice(sell_price - tp_dist) : 0.0;
+            if(!OrderAtLevel(sell_price) && !PositionAtLevel(sell_price))
+               PlaceOrder(ORDER_TYPE_SELL_LIMIT, sell_price, sell_tp, sell_sl);
+         }
+         else              // price extended below EMA — buy limits for mean reversion
+         {
+            double buy_price = NormalisePrice(mid - i * m_grid_spacing);
+            double buy_sl    = NormalisePrice(buy_price - atr * 1.0);
+            double buy_tp    = (tp_dist > 0.0) ? NormalisePrice(buy_price + tp_dist) : 0.0;
+            if(!OrderAtLevel(buy_price) && !PositionAtLevel(buy_price))
+               PlaceOrder(ORDER_TYPE_BUY_LIMIT, buy_price, buy_tp, buy_sl);
+         }
       }
       m_grid_active = true;
    }
@@ -175,14 +182,14 @@ public:
          {
             double price = NormalisePrice(mid + i * m_grid_spacing);
             double sl    = NormalisePrice(price - atr * 1.5);
-            double tp    = (tp_dist > 0.0) ? NormalisePrice(price + tp_dist) : 0.0;
+            double tp    = NormalisePrice(price + atr * 1.5);  // 1:1 RR — 1.5×ATR TP
             if(!OrderAtLevel(price)) PlaceOrder(ORDER_TYPE_BUY_STOP, price, tp, sl);
          }
          else
          {
             double price = NormalisePrice(mid - i * m_grid_spacing);
             double sl    = NormalisePrice(price + atr * 1.5);
-            double tp    = (tp_dist > 0.0) ? NormalisePrice(price - tp_dist) : 0.0;
+            double tp    = NormalisePrice(price - atr * 1.5);  // 1:1 RR — 1.5×ATR TP
             if(!OrderAtLevel(price)) PlaceOrder(ORDER_TYPE_SELL_STOP, price, tp, sl);
          }
       }
@@ -241,6 +248,7 @@ public:
    bool HasActiveGrid()        { return m_grid_active; }
    void SetActive(bool active) { m_grid_active = active; }
    void Deactivate()           { m_grid_active = false; }
+   void SetLotSize(double lot) { m_lot_size = lot; }
 };
 
 #endif // BGC_GRID_MANAGER_MQH
