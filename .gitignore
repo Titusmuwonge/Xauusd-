@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backtest/output/
+backtest/data/
+trader/logs/
