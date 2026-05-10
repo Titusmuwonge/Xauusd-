@@ -1,9 +1,15 @@
 """
-Main entry point — downloads data, runs baseline + optimisation, plots results.
+Main entry point — loads data, runs baseline + optimisation, plots results.
+
+Data priority (highest first):
+  1. backtest/data/XAUUSD_M15.csv  exported by export_from_mt5.py  (real, best)
+  2. Any GOLD_M15.csv / XAUUSD_M15_real.csv placed in backtest/data/
+  3. Synthetic data from generate_synthetic.py  (last resort, known limitations)
+
 Usage:
-    python run_backtest.py                        # quick run (yfinance 60d)
-    python run_backtest.py --source dukascopy     # deep run (3y tick data)
-    python run_backtest.py --optimise             # parameter sweep
+    python run_backtest.py              # baseline with best available data
+    python run_backtest.py --optimise   # full parameter sweep
+    python run_backtest.py --live       # analyse live MT5 trades from screenshot
 """
 
 import os
@@ -15,24 +21,19 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from itertools import product
 
-from download_data import download
+from load_data     import load_ohlcv, preferred_data_path
 from bgc_backtest  import BGCBacktest, BacktestParams, BacktestResult
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "XAUUSD_M15.csv")
-OUT_DIR   = os.path.join(os.path.dirname(__file__), "output")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────
-def load_data(source: str = "yfinance") -> pd.DataFrame:
-    if os.path.exists(DATA_FILE):
-        print(f"Using cached data: {DATA_FILE}")
-        df = pd.read_csv(DATA_FILE, index_col=0, parse_dates=True)
-    else:
-        df = download(source=source)
-    df.index = pd.to_datetime(df.index)
-    df = df[["open", "high", "low", "close", "volume"]].dropna()
-    print(f"Loaded {len(df)} bars  {df.index[0].date()} → {df.index[-1].date()}")
+def load_data(path: str = None) -> pd.DataFrame:
+    if path is None:
+        path = preferred_data_path("M15")
+    print(f"Loading: {path}")
+    df = load_ohlcv(path, timeframe="M15")
     return df
 
 
@@ -245,8 +246,8 @@ def analyse_live_trades():
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source",   default="yfinance",
-                        choices=["yfinance","dukascopy","alphavantage"])
+    parser.add_argument("--data",     default=None,
+                        help="Path to OHLCV CSV (default: best available in backtest/data/)")
     parser.add_argument("--optimise", action="store_true")
     parser.add_argument("--live",     action="store_true",
                         help="Analyse the MT5 live trades from the screenshot")
@@ -256,7 +257,7 @@ if __name__ == "__main__":
         analyse_live_trades()
         sys.exit(0)
 
-    df = load_data(args.source)
+    df = load_data(args.data)
 
     if args.optimise:
         run_optimisation(df)
