@@ -86,23 +86,42 @@ def load_ohlcv(path: str, timeframe: str = "M15") -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Data file not found: {path}")
 
-    # Try common MT4/MT5 export format: Date + Time as separate columns
-    try:
-        raw = pd.read_csv(path, nrows=3, header=0)
-        cols_lower = [c.strip().lower() for c in raw.columns]
+    # Auto-detect separator (semicolon vs comma)
+    with open(path, "r") as fh:
+        first_line = fh.readline()
+    sep = ";" if first_line.count(";") >= 3 else ","
 
-        if "date" in cols_lower and "time" in cols_lower:
-            # MT4/MT5 style: Date,Time,Open,High,Low,Close,Volume
-            df = pd.read_csv(path, header=0)
-            date_col = df.columns[cols_lower.index("date")]
-            time_col = df.columns[cols_lower.index("time")]
-            df.index = pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str))
-            df.index.name = None
-            df = df.drop(columns=[date_col, time_col])
-        else:
-            df = pd.read_csv(path, index_col=0, parse_dates=True)
-    except Exception:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    # Try common MT4/MT5 export: separate Date + Time columns  OR  combined Date col
+    raw = pd.read_csv(path, sep=sep, nrows=3, header=0)
+    cols_lower = [c.strip().lower() for c in raw.columns]
+
+    if "date" in cols_lower and "time" in cols_lower:
+        # MT4/MT5 style: Date,Time,Open,High,Low,Close,Volume
+        df = pd.read_csv(path, sep=sep, header=0)
+        date_col = df.columns[cols_lower.index("date")]
+        time_col = df.columns[cols_lower.index("time")]
+        df.index = pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str))
+        df = df.drop(columns=[date_col, time_col])
+    else:
+        # Combined datetime in first column — handle "YYYY.MM.DD HH:MM" (dots) or ISO
+        df = pd.read_csv(path, sep=sep, header=0)
+        # Find the datetime column (first non-numeric or explicitly named)
+        dt_col = None
+        for col in df.columns:
+            if col.strip().lower() in {c.lower() for c in _DATE_COLS}:
+                dt_col = col
+                break
+        if dt_col is None:
+            # Fall back: first column
+            dt_col = df.columns[0]
+        # Replace dots-as-date-separator: "2004.06.11" → "2004-06-11"
+        df[dt_col] = df[dt_col].astype(str).str.replace(
+            r"^(\d{4})\.(\d{2})\.(\d{2})", r"\1-\2-\3", regex=True
+        )
+        df.index = pd.to_datetime(df[dt_col])
+        df = df.drop(columns=[dt_col])
+
+    df.index.name = None
 
     # Normalise column names
     col_map = _detect_columns(df)
@@ -150,18 +169,20 @@ def load_ohlcv(path: str, timeframe: str = "M15") -> pd.DataFrame:
 
 def preferred_data_path(timeframe: str = "M15") -> str:
     """Return the path of the best available data file for *timeframe*."""
-    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    repo_root = os.path.join(os.path.dirname(__file__), "..")
+    data_dir  = os.path.join(os.path.dirname(__file__), "data")
     candidates = [
-        # Real MT5 export (best)
+        # User-uploaded real data in repo root
+        os.path.join(repo_root, "XAU_15m_data.csv"),
+        os.path.join(repo_root, f"XAU_{timeframe}_data.csv"),
+        # Real MT5 export in data dir
         os.path.join(data_dir, f"XAUUSD_{timeframe}.csv"),
-        # Alternative names people might use
         os.path.join(data_dir, f"xauusd_{timeframe.lower()}.csv"),
         os.path.join(data_dir, f"GOLD_{timeframe}.csv"),
         os.path.join(data_dir, f"XAUUSD_{timeframe}_real.csv"),
     ]
     for p in candidates:
-        if os.path.exists(p) and os.path.getsize(p) > 10_000:
-            return p
-    # Fall back to synthetic (warn the user)
-    synth = os.path.join(data_dir, f"XAUUSD_{timeframe}.csv")
-    return synth
+        if os.path.exists(p) and os.path.getsize(p) > 100_000:
+            return os.path.normpath(p)
+    # Fall back to synthetic
+    return os.path.join(data_dir, f"XAUUSD_{timeframe}.csv")
