@@ -123,7 +123,16 @@ public:
 
       m_trade.SetExpertMagicNumber((ulong)magic);
       m_trade.SetDeviationInPoints((ulong)slippage_pts);
-      m_trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+      // Detect broker's supported filling mode — IOC is rejected by most CFD brokers
+      int fill_mode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+      if(fill_mode & SYMBOL_FILLING_RETURN)
+         m_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+      else if(fill_mode & SYMBOL_FILLING_IOC)
+         m_trade.SetTypeFilling(ORDER_FILLING_IOC);
+      else
+         m_trade.SetTypeFilling(ORDER_FILLING_FOK);
+
       m_trade.LogLevel(LOG_LEVEL_ERRORS);
       return true;
    }
@@ -172,9 +181,8 @@ public:
       m_grid_spacing = NormalisePrice(atr * m_atr_mult);
       if(m_grid_spacing <= 0.0) return;
 
-      double mid     = (bid + ask) * 0.5;
-      double tp_dist = (m_tp_atr_mult > 0.0) ? atr * m_tp_atr_mult : 0.0;
-      int    levels  = MathMin(m_max_levels, 3);
+      double mid    = (bid + ask) * 0.5;
+      int    levels = MathMin(m_max_levels, 3);
 
       for(int i = 1; i <= levels; i++)
       {

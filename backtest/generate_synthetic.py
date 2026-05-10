@@ -28,42 +28,56 @@ def generate_xauusd_m15(
     rng = np.random.default_rng(seed)
 
     # ── Regime parameters (per M15 bar)
-    # drift = annualised / (96 bars/day * 252 days)
+    # sigma_annual / sqrt(96 bars/day * 252 days) = sigma_per_bar
+    # Gold: ranging≈12%, trending≈18%, volatile≈35% annual vol
     BARS_PA = 96 * 252
     regime_params = {
-        0: dict(mu= 0.00/BARS_PA, sigma=0.0045, jump_prob=0.001, jump_size=0.004),
-        1: dict(mu= 0.12/BARS_PA, sigma=0.0080, jump_prob=0.002, jump_size=0.008),
-        2: dict(mu= 0.00/BARS_PA, sigma=0.0180, jump_prob=0.010, jump_size=0.020),
+        # Ranging uses Ornstein-Uhlenbeck mean reversion (kappa = pull strength per bar).
+        # kappa=0.20 → half-life ≈ 3.5 bars (~53 min); price oscillates around anchor
+        # tightly enough that CUSUM z-score accumulation stays below threshold.
+        0: dict(mode="ou",  kappa=0.20, sigma=0.00077, jump_prob=0.001, jump_size=0.004),
+        1: dict(mode="gbm", mu= 0.15/BARS_PA, sigma=0.00116, jump_prob=0.002, jump_size=0.008),
+        2: dict(mode="gbm", mu= 0.00/BARS_PA, sigma=0.00225, jump_prob=0.010, jump_size=0.015),
     }
-    # Regime transition matrix (from row → to col)
+    # Transition matrix (row → col): ranging≈55%, trending≈38%, volatile≈7% steady-state
     trans = np.array([
-        [0.980, 0.015, 0.005],  # from ranging
-        [0.020, 0.970, 0.010],  # from trending
-        [0.050, 0.100, 0.850],  # from volatile
+        [0.970, 0.025, 0.005],  # from ranging
+        [0.040, 0.950, 0.010],  # from trending
+        [0.100, 0.150, 0.750],  # from volatile
     ])
 
-    prices = np.empty(n_bars + 1)
+    prices   = np.empty(n_bars + 1)
     prices[0] = start_price
     regime    = 0
     regimes   = np.empty(n_bars, dtype=int)
+    # OU anchor: slowly-drifting "fair value" that price reverts to in ranging
+    log_anchor = np.log(start_price)
 
     for i in range(n_bars):
-        p   = regime_params[regime]
-        mu  = p["mu"]
-        sig = p["sigma"]
-        jp  = p["jump_prob"]
-        js  = p["jump_size"]
+        p  = regime_params[regime]
+        jp = p["jump_prob"]
+        js = p["jump_size"]
 
-        z      = rng.standard_normal()
-        jump   = rng.choice([0, 1], p=[1 - jp, jp])
-        j_dir  = rng.choice([-1, 1])
-        j_mag  = rng.exponential(js) * j_dir * jump
+        z     = rng.standard_normal()
+        jump  = rng.choice([0, 1], p=[1 - jp, jp])
+        j_dir = rng.choice([-1, 1])
+        j_mag = rng.exponential(js) * j_dir * jump
 
-        r = mu + sig * z + j_mag
+        if p["mode"] == "ou":
+            # OU: r = kappa*(log_anchor - log_price) + sigma*z
+            # This pulls log-price back to anchor each bar.
+            log_pull = p["kappa"] * (log_anchor - np.log(prices[i]))
+            r = log_pull + p["sigma"] * z + j_mag
+            # Anchor itself drifts very slowly (real gold has a slight long-run bias)
+            log_anchor += rng.standard_normal() * 0.00010
+        else:
+            r = p["mu"] + p["sigma"] * z + j_mag
+            # In trending/volatile, anchor follows price so it doesn't snap back hard
+            log_anchor = 0.95 * log_anchor + 0.05 * np.log(prices[i])
+
         prices[i + 1] = prices[i] * np.exp(r)
-
-        regimes[i] = regime
-        regime = rng.choice(3, p=trans[regime])
+        regimes[i]    = regime
+        regime         = rng.choice(3, p=trans[regime])
 
     # Build M15 OHLCV bars from the close series
     c = prices[1:]      # close

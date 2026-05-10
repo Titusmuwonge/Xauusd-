@@ -142,7 +142,15 @@ public:
 
       m_trade.SetExpertMagicNumber((ulong)magic);
       m_trade.SetDeviationInPoints((ulong)slippage_pts);
-      m_trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+      int fill_mode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+      if(fill_mode & SYMBOL_FILLING_RETURN)
+         m_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+      else if(fill_mode & SYMBOL_FILLING_IOC)
+         m_trade.SetTypeFilling(ORDER_FILLING_IOC);
+      else
+         m_trade.SetTypeFilling(ORDER_FILLING_FOK);
+
       m_trade.LogLevel(LOG_LEVEL_ERRORS);
       return true;
    }

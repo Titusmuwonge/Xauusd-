@@ -32,8 +32,11 @@ from state_logger  import StateLogger
 from bgc_backtest  import BacktestParams
 
 # ── Configuration ────────────────────────────────────────────────
+# IMPORTANT: Use a DIFFERENT magic number from the MQL5 EA (20260505) to prevent
+# both systems managing the same orders if the EA is also loaded in MT5.
+# Default 20260506 = Python agent; 20260505 = MQL5 EA. Never run both on the same magic.
 SYMBOL          = os.environ.get("BGC_SYMBOL",  "XAUUSD")
-MAGIC           = int(os.environ.get("BGC_MAGIC",   "20260505"))
+MAGIC           = int(os.environ.get("BGC_MAGIC",   "20260506"))
 RISK_PCT        = float(os.environ.get("BGC_RISK",  "1.0"))
 MAX_LEVELS      = int(os.environ.get("BGC_LEVELS",  "4"))
 GRID_ATR_MULT   = float(os.environ.get("BGC_GRID",  "0.7"))

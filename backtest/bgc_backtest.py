@@ -216,28 +216,33 @@ class BGCBacktest:
                 self._place(OrderType.SELL_STOP, price, sl, tp, spacing, ts)
 
     # ── Order → Position fill check ─────────────────────────────
-    def _check_fills(self, row: pd.Series, ts: pd.Timestamp):
-        filled = []
+    def _check_fills(self, row: pd.Series, ts: pd.Timestamp) -> set:
+        """Return set of ids filled this bar so _check_exits can skip same-bar exits."""
+        filled      = []
+        filled_ids  = set()
         for o in self.orders:
             hi, lo = row["high"], row["low"]
-            ask = row["close"] + self.spread
-            bid = row["close"]
 
             triggered = False
             fill_price = o.open_price
 
+            # Limit orders: fill at the order price (worst case — no extra slippage).
+            # Stop orders: fill at the order price ± spread (the stop triggers a market
+            # order at that exact level; the bar close must NOT be used as the fill
+            # reference — doing so produced systematic multi-dollar slippage that
+            # destroyed the stop grid's risk/reward entirely).
             if o.type == OrderType.BUY_LIMIT  and lo <= o.open_price:
-                triggered = True
-                fill_price = min(ask, o.open_price)
+                triggered  = True
+                fill_price = o.open_price               # buy at limit (or better)
             elif o.type == OrderType.SELL_LIMIT and hi >= o.open_price:
-                triggered = True
-                fill_price = max(bid, o.open_price)
+                triggered  = True
+                fill_price = o.open_price               # sell at limit (or better)
             elif o.type == OrderType.BUY_STOP  and hi >= o.open_price:
-                triggered = True
-                fill_price = max(ask, o.open_price)
+                triggered  = True
+                fill_price = o.open_price + self.spread # stop → market buy at ask
             elif o.type == OrderType.SELL_STOP  and lo <= o.open_price:
-                triggered = True
-                fill_price = min(bid, o.open_price)
+                triggered  = True
+                fill_price = o.open_price - self.spread # stop → market sell at bid
 
             if triggered:
                 direction = 1 if o.type in (OrderType.BUY_LIMIT, OrderType.BUY_STOP) else -1
@@ -248,41 +253,68 @@ class BGCBacktest:
                 )
                 self.positions.append(pos)
                 filled.append(o)
+                filled_ids.add(pos.id)
                 if self.cycle_start is None:
                     self.cycle_start = ts
 
         for o in filled:
             self.orders.remove(o)
+        return filled_ids
 
     # ── SL / TP checks ──────────────────────────────────────────
-    def _check_exits(self, row: pd.Series, ts: pd.Timestamp):
+    def _check_exits(self, row: pd.Series, ts: pd.Timestamp, skip_ids: set = None):
+        """skip_ids: positions filled this same bar — they cannot exit until next bar."""
         hi, lo = row["high"], row["low"]
-        mid = row["close"]
         exited = []
+        if skip_ids is None:
+            skip_ids = set()
 
         for pos in self.positions:
+            if pos.id in skip_ids:   # filled this bar → no same-bar exit
+                continue
+            sl_hit = tp_hit = False
+
             if pos.direction > 0:  # long
-                if lo <= pos.sl:
-                    pos.exit_price = pos.sl
-                    pos.exit_reason = "SL"
-                    pos.pnl = self._position_pnl(pos, pos.sl)
-                    exited.append(pos)
-                elif pos.tp > 0 and hi >= pos.tp:
-                    pos.exit_price = pos.tp
-                    pos.exit_reason = "TP"
-                    pos.pnl = self._position_pnl(pos, pos.tp)
-                    exited.append(pos)
+                sl_hit = lo <= pos.sl
+                tp_hit = pos.tp > 0 and hi >= pos.tp
             else:  # short
-                if hi >= pos.sl:
-                    pos.exit_price = pos.sl
-                    pos.exit_reason = "SL"
-                    pos.pnl = self._position_pnl(pos, pos.sl)
-                    exited.append(pos)
-                elif pos.tp > 0 and lo <= pos.tp:
-                    pos.exit_price = pos.tp
-                    pos.exit_reason = "TP"
-                    pos.pnl = self._position_pnl(pos, pos.tp)
-                    exited.append(pos)
+                sl_hit = hi >= pos.sl
+                tp_hit = pos.tp > 0 and lo <= pos.tp
+
+            if not sl_hit and not tp_hit:
+                continue
+
+            # Resolve same-bar conflict: whichever level is closer to entry hit first.
+            # Tiebreak via close direction when equidistant.
+            if sl_hit and tp_hit:
+                if pos.direction > 0:
+                    dist_sl = pos.entry - pos.sl
+                    dist_tp = pos.tp - pos.entry
+                else:
+                    dist_sl = pos.sl - pos.entry
+                    dist_tp = pos.entry - pos.tp
+                if dist_sl < dist_tp:
+                    tp_hit = False
+                elif dist_tp < dist_sl:
+                    sl_hit = False
+                else:
+                    # Equidistant: close direction determines which ran first
+                    if pos.direction > 0:
+                        sl_hit = row["close"] < pos.entry
+                        tp_hit = not sl_hit
+                    else:
+                        sl_hit = row["close"] > pos.entry
+                        tp_hit = not sl_hit
+
+            if sl_hit:
+                pos.exit_price  = pos.sl
+                pos.exit_reason = "SL"
+                pos.pnl         = self._position_pnl(pos, pos.sl)
+            else:
+                pos.exit_price  = pos.tp
+                pos.exit_reason = "TP"
+                pos.pnl         = self._position_pnl(pos, pos.tp)
+            exited.append(pos)
 
         for pos in exited:
             pos.closed_at = ts
@@ -345,13 +377,20 @@ class BGCBacktest:
             if pd.isna(row["atr"]) or pd.isna(row["ema"]):
                 continue
 
+            # Stop simulation when account is ruined (< 5 % of starting equity).
+            # Without this guard the sim runs zombie trades on a negative balance.
+            if self.balance < self.p.initial_balance * 0.05:
+                self._liquidate(row, ts, "Bankrupt")
+                self.orders.clear()
+                break
+
             mid  = row["close"]
             atr  = row["atr"]
             ema  = row["ema"]
             reg  = Regime(row["regime"])
 
-            self._check_fills(row, ts)
-            self._check_exits(row, ts)
+            filled_ids = self._check_fills(row, ts)
+            self._check_exits(row, ts, skip_ids=filled_ids)
 
             # Risk checks every bar (pass row so liquidation uses correct bid/ask)
             if self._check_risk(row, ts):
