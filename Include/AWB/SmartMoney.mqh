@@ -1,155 +1,114 @@
 //+------------------------------------------------------------------+
-//| AWB SmartMoney.mqh                                               |
-//| Fair Value Gap (FVG), Order Block (OB), Engulfing detection      |
+//| AWB SmartMoney.mqh  v2                                           |
+//| FVG zone detection on the BOS bar itself (no lookahead)          |
 //+------------------------------------------------------------------+
 #pragma once
+#include "MarketStructure.mqh"
 
-struct FVG
+// Minimum/maximum FVG gap in pips
+#define FVG_MIN_PIPS  1
+#define FVG_MAX_PIPS 25
+
+//--- Bearish FVG zone: gap between bar[3].low and bar[1].high in the 15M array
+//    (bar[1] = BOS bar, bar[3] = two bars before it)
+//    zone_h = bar[3].low, zone_l = bar[1].high
+//    Valid when gap >= 1 pip AND zone is above bar[1].close
+//    Returns true and fills zone_h / zone_l.
+bool FVG_Zone_Bear(const MqlRates &r15[], double &zone_h, double &zone_l)
 {
-   double high;
-   double low;
-   bool   bearish; // true = price came from above (sell FVG), false = buy FVG
-   int    bar;     // index of the middle candle of the 3-candle pattern
-   bool   valid;
-};
+   zone_h = 0; zone_l = 0;
+   if(ArraySize(r15) < 5) return false;
 
-struct OrderBlock
-{
-   double high;
-   double low;
-   bool   bearish; // true = last bullish candle before bearish impulse
-   int    bar;
-   bool   valid;
-};
+   double pip = AWB_PipSize();
+   double minGap = FVG_MIN_PIPS * pip;
+   double maxGap = FVG_MAX_PIPS * pip;
 
-//--- Detect the most recent bearish FVG within lookback bars
-//    Pattern: rates[i+2].low > rates[i].high  (gap between candle[i+2] and candle[i])
-//    In array notation (index 0 = most recent): need 3 consecutive candles
-FVG DetectFVG_Bearish(const MqlRates &rates[], int lookback = 50)
-{
-   FVG fvg;
-   fvg.valid = false;
-   int total = ArraySize(rates);
-
-   for(int i = 1; i <= lookback && i + 2 < total; i++)
+   // Primary: bars [3,1] (2-bar separation around the BOS bar)
+   double gap = r15[3].low - r15[1].high;
+   if(gap >= minGap && gap <= maxGap)
    {
-      // rates[i-1] = most recent of the trio, rates[i] = middle, rates[i+1] = oldest
-      // Bearish FVG: high of candle[i+1] < low of candle[i-1]
-      if(rates[i+1].high < rates[i-1].low)
+      zone_h = r15[3].low;
+      zone_l = r15[1].high;
+      return (zone_l > r15[1].close);
+   }
+
+   // Secondary: bars [4,2]
+   if(ArraySize(r15) >= 6)
+   {
+      gap = r15[4].low - r15[2].high;
+      if(gap >= minGap && gap <= maxGap)
       {
-         fvg.high    = rates[i-1].low;
-         fvg.low     = rates[i+1].high;
-         fvg.bearish = true;
-         fvg.bar     = i;
-         fvg.valid   = true;
-         return fvg;
+         zone_h = r15[4].low;
+         zone_l = r15[2].high;
+         return (zone_l > r15[1].close);
       }
    }
-   return fvg;
+
+   // Fallback: 2-bar gap [2,1]
+   gap = r15[2].low - r15[1].high;
+   if(gap >= minGap && gap <= maxGap)
+   {
+      zone_h = r15[2].low;
+      zone_l = r15[1].high;
+      return (zone_l > r15[1].close);
+   }
+
+   return false;
 }
 
-//--- Detect the most recent bullish FVG
-//    Bullish FVG: low of candle[i+1] > high of candle[i-1]
-FVG DetectFVG_Bullish(const MqlRates &rates[], int lookback = 50)
+//--- Bullish FVG zone: gap between bar[1].low and bar[3].high in the 15M array
+//    (bar[1] = BOS bar going up, bar[3] = two bars before it)
+//    zone_h = bar[1].low, zone_l = bar[3].high
+//    Valid when gap >= 1 pip AND zone is below bar[1].close
+bool FVG_Zone_Bull(const MqlRates &r15[], double &zone_h, double &zone_l)
 {
-   FVG fvg;
-   fvg.valid = false;
-   int total = ArraySize(rates);
+   zone_h = 0; zone_l = 0;
+   if(ArraySize(r15) < 5) return false;
 
-   for(int i = 1; i <= lookback && i + 2 < total; i++)
+   double pip = AWB_PipSize();
+   double minGap = FVG_MIN_PIPS * pip;
+   double maxGap = FVG_MAX_PIPS * pip;
+
+   // Primary: bars [3,1]
+   double gap = r15[1].low - r15[3].high;
+   if(gap >= minGap && gap <= maxGap)
    {
-      if(rates[i+1].low > rates[i-1].high)
+      zone_h = r15[1].low;
+      zone_l = r15[3].high;
+      return (zone_h < r15[1].close);
+   }
+
+   // Secondary: bars [4,2]
+   if(ArraySize(r15) >= 6)
+   {
+      gap = r15[2].low - r15[4].high;
+      if(gap >= minGap && gap <= maxGap)
       {
-         fvg.high    = rates[i+1].low;
-         fvg.low     = rates[i-1].high;
-         fvg.bearish = false;
-         fvg.bar     = i;
-         fvg.valid   = true;
-         return fvg;
+         zone_h = r15[2].low;
+         zone_l = r15[4].high;
+         return (zone_h < r15[1].close);
       }
    }
-   return fvg;
-}
 
-//--- Detect the Order Block: last bullish candle before a bearish BOS impulse
-//    bosBar = bar index where BOS occurred; search backward from there
-OrderBlock DetectOrderBlock_Bearish(const MqlRates &rates[], int bosBar, int lookback = 10)
-{
-   OrderBlock ob;
-   ob.valid = false;
-   int total = ArraySize(rates);
-
-   for(int i = bosBar + 1; i <= bosBar + lookback && i < total; i++)
+   // Fallback: 2-bar gap [2,1]
+   gap = r15[1].low - r15[2].high;
+   if(gap >= minGap && gap <= maxGap)
    {
-      // Last bullish candle (close > open) before the impulse move
-      if(rates[i].close > rates[i].open)
-      {
-         ob.high    = rates[i].high;
-         ob.low     = rates[i].low;
-         ob.bearish = true;
-         ob.bar     = i;
-         ob.valid   = true;
-         return ob;
-      }
+      zone_h = r15[1].low;
+      zone_l = r15[2].high;
+      return (zone_h < r15[1].close);
    }
-   return ob;
+
+   return false;
 }
 
-//--- Last bearish candle before bullish BOS impulse
-OrderBlock DetectOrderBlock_Bullish(const MqlRates &rates[], int bosBar, int lookback = 10)
+//--- True if price is within 8 pips of zone (not blown through it)
+bool Zone_Intact_Buy(double price, double zone_l, int blownPips = 8)
 {
-   OrderBlock ob;
-   ob.valid = false;
-   int total = ArraySize(rates);
-
-   for(int i = bosBar + 1; i <= bosBar + lookback && i < total; i++)
-   {
-      if(rates[i].close < rates[i].open)
-      {
-         ob.high    = rates[i].high;
-         ob.low     = rates[i].low;
-         ob.bearish = false;
-         ob.bar     = i;
-         ob.valid   = true;
-         return ob;
-      }
-   }
-   return ob;
+   return price >= zone_l - blownPips * AWB_PipSize();
 }
 
-//--- Price is inside a zone
-bool PriceInZone(double price, double zoneHigh, double zoneLow)
+bool Zone_Intact_Sell(double price, double zone_h, int blownPips = 8)
 {
-   return (price >= zoneLow && price <= zoneHigh);
-}
-
-//--- Bearish engulfing on the current closed bar (bar index 1)
-//    Current candle opens above previous close and closes below previous open
-bool DetectEngulfing_Bearish(const MqlRates &rates[])
-{
-   if(ArraySize(rates) < 3) return false;
-   double curOpen  = rates[1].open;
-   double curClose = rates[1].close;
-   double prevOpen = rates[2].open;
-   double prevClose= rates[2].close;
-
-   // Previous candle must be bullish
-   if(prevClose <= prevOpen) return false;
-   // Current candle must be bearish and fully engulf previous body
-   return (curOpen >= prevClose && curClose < prevOpen);
-}
-
-//--- Bullish engulfing
-bool DetectEngulfing_Bullish(const MqlRates &rates[])
-{
-   if(ArraySize(rates) < 3) return false;
-   double curOpen  = rates[1].open;
-   double curClose = rates[1].close;
-   double prevOpen = rates[2].open;
-   double prevClose= rates[2].close;
-
-   // Previous candle must be bearish
-   if(prevClose >= prevOpen) return false;
-   // Current candle must be bullish and fully engulf previous body
-   return (curOpen <= prevClose && curClose > prevOpen);
+   return price <= zone_h + blownPips * AWB_PipSize();
 }

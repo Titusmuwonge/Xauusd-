@@ -1,88 +1,115 @@
 //+------------------------------------------------------------------+
-//| AWB RiskManager.mqh                                              |
-//| Dynamic lot sizing + order placement                             |
+//| AWB RiskManager.mqh  v2                                          |
+//| Lot sizing, order placement, breakeven management                |
 //+------------------------------------------------------------------+
 #pragma once
 #include <Trade\Trade.mqh>
 
-//--- Calculate lot size so that SL_pips represents riskPct% of account balance
+double AWB_PipSizeRM(string sym = NULL)
+{
+   if(sym == NULL || sym == "") sym = _Symbol;
+   int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   return ((d == 3 || d == 5) ? SymbolInfoDouble(sym, SYMBOL_POINT) * 10.0
+                               : SymbolInfoDouble(sym, SYMBOL_POINT));
+}
+
+//--- Lot size: risk riskPct% of balance on slPips stop
 double CalcLotSize(double riskPct, int slPips, string symbol = NULL)
 {
    if(symbol == NULL || symbol == "") symbol = _Symbol;
 
-   double balance     = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount  = balance * (riskPct / 100.0);
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * (riskPct / 100.0);
+   double tickSz     = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickVal    = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double pip        = AWB_PipSizeRM(symbol);
+   double pipVal     = (tickSz > 0) ? (pip / tickSz) * tickVal : 0;
 
-   double tickSize    = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tickValue   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-   double point       = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   int    digits      = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(pipVal <= 0) return SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
 
-   // pip value per lot = (pip_size / tick_size) * tick_value
-   double pipSize     = (digits == 3 || digits == 5) ? point * 10 : point;
-   double pipValue    = (pipSize / tickSize) * tickValue;
-
-   if(pipValue <= 0) return 0.01;
-
-   double lots = riskAmount / (slPips * pipValue);
-
-   // Round to broker step
+   double lots = riskAmount / (slPips * pipVal);
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    lots = MathFloor(lots / step) * step;
-
-   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-
+   lots = MathMax(SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN),
+                  MathMin(lots, SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX)));
    return lots;
 }
 
-//--- Convert pips to price distance
-double PipsToPrice(int pips, string symbol = NULL)
+double PipsToPrice(int pips, string sym = NULL)
 {
-   if(symbol == NULL || symbol == "") symbol = _Symbol;
-   int    digits  = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   double point   = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double pipSize = (digits == 3 || digits == 5) ? point * 10 : point;
-   return pips * pipSize;
+   if(sym == NULL || sym == "") sym = _Symbol;
+   return pips * AWB_PipSizeRM(sym);
 }
 
-//--- Place a sell order
-ulong PlaceSellOrder(CTrade &trade, double lots, int slPips, int tpPips, string symbol = NULL)
+//--- Place sell at market
+ulong PlaceSellOrder(CTrade &trade, double lots, int slPips, int tpPips, string sym = NULL)
 {
-   if(symbol == NULL || symbol == "") symbol = _Symbol;
-   double bid   = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double slDist = PipsToPrice(slPips, symbol);
-   double tpDist = PipsToPrice(tpPips, symbol);
-   double sl    = bid + slDist;
-   double tp    = bid - tpDist;
-   trade.Sell(lots, symbol, bid, sl, tp, "AWB_Sell");
+   if(sym == NULL || sym == "") sym = _Symbol;
+   double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
+   double slDst = PipsToPrice(slPips, sym);
+   double tpDst = PipsToPrice(tpPips, sym);
+   trade.Sell(lots, sym, bid, bid + slDst, bid - tpDst, "AWB_Sell");
    return trade.ResultOrder();
 }
 
-//--- Place a buy order
-ulong PlaceBuyOrder(CTrade &trade, double lots, int slPips, int tpPips, string symbol = NULL)
+//--- Place buy at market
+ulong PlaceBuyOrder(CTrade &trade, double lots, int slPips, int tpPips, string sym = NULL)
 {
-   if(symbol == NULL || symbol == "") symbol = _Symbol;
-   double ask   = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double slDist = PipsToPrice(slPips, symbol);
-   double tpDist = PipsToPrice(tpPips, symbol);
-   double sl    = ask - slDist;
-   double tp    = ask + tpDist;
-   trade.Buy(lots, symbol, ask, sl, tp, "AWB_Buy");
+   if(sym == NULL || sym == "") sym = _Symbol;
+   double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double slDst = PipsToPrice(slPips, sym);
+   double tpDst = PipsToPrice(tpPips, sym);
+   trade.Buy(lots, sym, ask, ask - slDst, ask + tpDst, "AWB_Buy");
    return trade.ResultOrder();
 }
 
-//--- Count open positions for this EA (by magic number)
-int CountOpenPositions(long magic, string symbol = NULL)
+//--- Move SL to breakeven (entry ± 1 pip) once price has moved slPips in our favour
+//    Call on every tick while a position is open.
+void ManageBreakeven(CTrade &trade, long magic, int slPips, string sym = NULL)
 {
-   if(symbol == NULL || symbol == "") symbol = _Symbol;
+   if(sym == NULL || sym == "") sym = _Symbol;
+   double pip = AWB_PipSizeRM(sym);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym)  continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != magic) continue;
+
+      double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl     = PositionGetDouble(POSITION_SL);
+      double tp     = PositionGetDouble(POSITION_TP);
+      long   ptype  = PositionGetInteger(POSITION_TYPE);
+      double beDist = slPips * pip;
+
+      if(ptype == POSITION_TYPE_BUY)
+      {
+         double beLevel = entry + beDist;   // 1R above entry
+         double newSL   = entry + pip;      // just above entry
+         if(SymbolInfoDouble(sym, SYMBOL_BID) >= beLevel && sl < newSL - pip)
+            trade.PositionModify(ticket, newSL, tp);
+      }
+      else // SELL
+      {
+         double beLevel = entry - beDist;
+         double newSL   = entry - pip;
+         if(SymbolInfoDouble(sym, SYMBOL_ASK) <= beLevel && sl > newSL + pip)
+            trade.PositionModify(ticket, newSL, tp);
+      }
+   }
+}
+
+//--- Count open positions for this EA
+int CountOpenPositions(long magic, string sym = NULL)
+{
+   if(sym == NULL || sym == "") sym = _Symbol;
    int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) == symbol &&
+      if(PositionGetString(POSITION_SYMBOL) == sym &&
          PositionGetInteger(POSITION_MAGIC) == magic)
          count++;
    }

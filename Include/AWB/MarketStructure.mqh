@@ -1,101 +1,99 @@
 //+------------------------------------------------------------------+
-//| AWB MarketStructure.mqh                                          |
-//| Swing high/low detection, BOS, and manipulation identification   |
+//| AWB MarketStructure.mqh  v2                                      |
+//| BOS detection (strong body + new N-bar extreme) + sweep filter   |
 //+------------------------------------------------------------------+
 #pragma once
 
-struct SwingPoint
+// Pip helpers (5-digit brokers)
+double AWB_PipSize(string sym = NULL)
 {
-   double price;
-   int    bar;
-   bool   isHigh;
-};
+   if(sym == NULL || sym == "") sym = _Symbol;
+   int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   return ((d == 3 || d == 5) ? SymbolInfoDouble(sym, SYMBOL_POINT) * 10.0
+                               : SymbolInfoDouble(sym, SYMBOL_POINT));
+}
 
-//--- Find most recent swing high within lookback bars (on a given rates array)
-SwingPoint FindSwingHigh(const MqlRates &rates[], int lookback)
+//--- Bearish BOS: bar[1] has bearish body >= minBodyPips AND close below prior lb-bar lows
+//    rates[] must be series (index 0 = newest / forming, index 1 = last closed)
+bool Is_BOS_Bear(const MqlRates &r15[], int lb = 12, int minBodyPips = 5)
 {
-   SwingPoint sp;
-   sp.price  = 0;
-   sp.bar    = -1;
-   sp.isHigh = true;
+   if(ArraySize(r15) < lb + 3) return false;
+   double pip = AWB_PipSize();
+   if((r15[1].open - r15[1].close) < minBodyPips * pip) return false;
 
-   int total = ArraySize(rates);
-   if(total < lookback + 2) return sp;
+   // close must be strictly below the lowest LOW of bars [2 .. lb+1]
+   double minLow = r15[2].low;
+   for(int i = 3; i <= lb + 1 && i < ArraySize(r15); i++)
+      minLow = MathMin(minLow, r15[i].low);
 
-   // Search from most recent bar backward; bar 0 = current (incomplete), start at 1
-   for(int i = 1; i <= lookback && i < total - 1; i++)
+   return r15[1].close < minLow;
+}
+
+//--- Bullish BOS: bar[1] has bullish body >= minBodyPips AND close above prior lb-bar highs
+bool Is_BOS_Bull(const MqlRates &r15[], int lb = 12, int minBodyPips = 5)
+{
+   if(ArraySize(r15) < lb + 3) return false;
+   double pip = AWB_PipSize();
+   if((r15[1].close - r15[1].open) < minBodyPips * pip) return false;
+
+   double maxHigh = r15[2].high;
+   for(int i = 3; i <= lb + 1 && i < ArraySize(r15); i++)
+      maxHigh = MathMax(maxHigh, r15[i].high);
+
+   return r15[1].close > maxHigh;
+}
+
+//--- Find highest swing high in bars [2 .. lb+2] of the 1H array
+double Swing_High_1H(const MqlRates &r1h[], int lb = 8)
+{
+   double best = 0;
+   int total = ArraySize(r1h);
+   for(int i = 2; i < lb + 3 && i < total - 1; i++)
    {
-      if(rates[i].high > rates[i-1].high && rates[i].high > rates[i+1].high)
-      {
-         if(sp.bar == -1 || rates[i].high > sp.price)
-         {
-            sp.price = rates[i].high;
-            sp.bar   = i;
-         }
-      }
+      if(r1h[i].high > r1h[i-1].high && r1h[i].high > r1h[i+1].high)
+         best = MathMax(best, r1h[i].high);
    }
-   return sp;
+   return best;
 }
 
-//--- Find most recent swing low within lookback bars
-SwingPoint FindSwingLow(const MqlRates &rates[], int lookback)
+//--- Find lowest swing low in bars [2 .. lb+2] of the 1H array
+double Swing_Low_1H(const MqlRates &r1h[], int lb = 8)
 {
-   SwingPoint sp;
-   sp.price  = DBL_MAX;
-   sp.bar    = -1;
-   sp.isHigh = false;
-
-   int total = ArraySize(rates);
-   if(total < lookback + 2) return sp;
-
-   for(int i = 1; i <= lookback && i < total - 1; i++)
+   double best = DBL_MAX;
+   int total = ArraySize(r1h);
+   for(int i = 2; i < lb + 3 && i < total - 1; i++)
    {
-      if(rates[i].low < rates[i-1].low && rates[i].low < rates[i+1].low)
-      {
-         if(sp.bar == -1 || rates[i].low < sp.price)
-         {
-            sp.price = rates[i].low;
-            sp.bar   = i;
-         }
-      }
+      if(r1h[i].low < r1h[i-1].low && r1h[i].low < r1h[i+1].low)
+         best = MathMin(best, r1h[i].low);
    }
-   return sp;
+   return (best == DBL_MAX) ? 0 : best;
 }
 
-//--- Bearish BOS: latest closed bar closed below the recent swing low
-bool DetectBOS_Bearish(const MqlRates &rates[], double swingLowPrice)
+//--- Swept Up: within last lb bars of 1H, any bar had wick > swingHigh + 3 pips AND close < swingHigh - 3 pips
+bool Swept_Up(const MqlRates &r1h[], double swingHigh, int lb = 8)
 {
-   if(ArraySize(rates) < 2 || swingLowPrice <= 0) return false;
-   return (rates[1].close < swingLowPrice);
-}
-
-//--- Bullish BOS: latest closed bar closed above the recent swing high
-bool DetectBOS_Bullish(const MqlRates &rates[], double swingHighPrice)
-{
-   if(ArraySize(rates) < 2 || swingHighPrice <= 0) return false;
-   return (rates[1].close > swingHighPrice);
-}
-
-//--- Manipulation to the upside: wick pierced above swingHigh but candle closed back below it
-//    Looks back up to lookback bars for such a candle
-bool DetectManipulation_Up(const MqlRates &rates[], double swingHighPrice, int lookback = 5)
-{
-   int total = ArraySize(rates);
-   for(int i = 1; i <= lookback && i < total; i++)
+   if(swingHigh <= 0) return false;
+   double pip = AWB_PipSize();
+   double minWick = 3 * pip;
+   for(int k = 1; k <= lb && k < ArraySize(r1h); k++)
    {
-      if(rates[i].high > swingHighPrice && rates[i].close < swingHighPrice)
+      if(r1h[k].high > swingHigh + minWick &&
+         r1h[k].close < swingHigh - minWick)
          return true;
    }
    return false;
 }
 
-//--- Manipulation to the downside: wick pierced below swingLow but candle closed back above it
-bool DetectManipulation_Down(const MqlRates &rates[], double swingLowPrice, int lookback = 5)
+//--- Swept Down: within last lb bars of 1H, any bar had wick < swingLow - 3 pips AND close > swingLow + 3 pips
+bool Swept_Down(const MqlRates &r1h[], double swingLow, int lb = 8)
 {
-   int total = ArraySize(rates);
-   for(int i = 1; i <= lookback && i < total; i++)
+   if(swingLow <= 0) return false;
+   double pip = AWB_PipSize();
+   double minWick = 3 * pip;
+   for(int k = 1; k <= lb && k < ArraySize(r1h); k++)
    {
-      if(rates[i].low < swingLowPrice && rates[i].close > swingLowPrice)
+      if(r1h[k].low < swingLow - minWick &&
+         r1h[k].close > swingLow + minWick)
          return true;
    }
    return false;

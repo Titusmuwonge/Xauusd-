@@ -1,7 +1,22 @@
 """
-AWB SetupTrader — Python Backtester (numpy-optimized)
-Implements both SMC setups using EURUSD 5M, 15M, 1H data.
-Sessions in EAT (UTC+3, Africa/Nairobi).
+AWB SetupTrader — Python Backtester v10
+Core fix from v9: remove the complex engulfing entry filter.
+Empirical analysis showed the engulfing requirement killed the 60% WR edge
+by selecting the wrong subset of zone touches.
+
+Logic:
+  Setup detection (unchanged from v9):
+    - 15M BOS: strong body (≥5 pips), close makes new 12-bar extreme
+    - 1H sweep confirms institutional intent (wick through swing, close back)
+    - FVG zone detected immediately on BOS close (no lookahead)
+
+  Entry (simplified):
+    - Session gate: London 07-09 UTC or NY 12-14 UTC
+    - BUY: price first drops into zone (low <= zone_h) without blowing through
+    - SELL: price first rises into zone (high >= zone_l) without blowing through
+    - Enter at open of next 5M bar; SL 15 pips, TP 34 pips, BE at 1R
+
+Empirical baseline (separate diagnostic): BUY 60% WR, SELL 43.5% WR.
 """
 
 import pandas as pd
@@ -9,410 +24,322 @@ import numpy as np
 import pytz
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DATA_DIR   = Path(__file__).parent.parent
-EAT        = pytz.timezone("Africa/Nairobi")
+DATA_DIR = Path(__file__).parent.parent
+EAT      = pytz.timezone("Africa/Nairobi")
 
-SL_PIPS    = 15
-TP_PIPS    = 34
-PIP_SIZE   = 0.0001          # EURUSD 5-digit broker
-RISK_PCT   = 0.01            # 1% of equity per trade
-INIT_BAL   = 10_000.0
+SL_PIPS  = 15
+TP_PIPS  = 34
+PIP      = 0.0001
+RISK_PCT = 1.5
+INIT_BAL = 10_000.0
 
-SWING_LB         = 10
-FVG_LB           = 30
-MAN_LB           = 5
-MIN_FVG_PIPS     = 5
-MIN_ENGULF_PIPS  = 3
-BOS_MAX_AGE      = 8
-COOLDOWN_BARS    = 24
+LONDON_UTC_START, LONDON_UTC_END = 7,  9
+NY_UTC_START,     NY_UTC_END     = 12, 14
 
-LONDON_START = 10            # EAT hour
-LONDON_END   = 12
-NY_START     = 15
-NY_END       = 17
+SWEEP_MIN_WICK  = 3  * PIP
+SWEEP_MIN_BODY  = 3  * PIP
+MIN_BOS_BODY    = 5  * PIP
+MIN_FVG_GAP     = 1  * PIP
+MAX_FVG_GAP     = 25 * PIP
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
+SWING_LB_1H     = 8
+BOS_NEW_LOW_LB  = 12
+ZONE_EXPIRY_5M  = 288   # 24 hours
+ZONE_BLOWN_PIPS = 8     # zone invalidated if price moves this far through it
 
-def load_5m() -> pd.DataFrame:
+DAILY_LOSS = 0.04
+MAX_DD     = 0.09
+
+
+# ── Data loaders ─────────────────────────────────────────────────────────────
+
+def load_5m():
     df = pd.read_csv(DATA_DIR / "EURUSD5.csv", sep="\t", header=None,
-                     names=["time", "open", "high", "low", "close", "volume"],
-                     parse_dates=["time"])
+                     names=["time","open","high","low","close","volume"])
     df["time"] = pd.to_datetime(df["time"], utc=True)
     return df.sort_values("time").reset_index(drop=True)
 
 
-def load_htf(filename: str) -> pd.DataFrame:
-    df = pd.read_csv(DATA_DIR / filename, parse_dates=["Timestamp"])
-    df = df.rename(columns={"Timestamp": "time"})
+def load_ohlc(fn):
+    df = pd.read_csv(DATA_DIR / fn, parse_dates=["Timestamp"]).rename(
+         columns={"Timestamp": "time"})
     df["time"] = pd.to_datetime(df["time"], utc=True)
     return df.sort_values("time").reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Session helper  (vectorised against EAT timezone)
-# ---------------------------------------------------------------------------
+# ── Indicators ───────────────────────────────────────────────────────────────
 
-def in_session_mask(times: pd.DatetimeIndex) -> np.ndarray:
-    eat_hours = times.tz_convert(EAT).hour
-    return ((eat_hours >= LONDON_START) & (eat_hours < LONDON_END)) | \
-           ((eat_hours >= NY_START)     & (eat_hours < NY_END))
-
-
-# ---------------------------------------------------------------------------
-# Numpy-array detectors  (operate on slices ending at idx-inclusive)
-# Index convention: idx is the LAST CLOSED bar (newest)
-# ---------------------------------------------------------------------------
-
-def find_swing_high(high: np.ndarray, idx: int, lookback: int) -> float:
-    if idx < lookback + 2:
-        return np.nan
-    best = np.nan
-    # window ends at idx-1 (most recent CLOSED swing candidate)
-    for i in range(idx - lookback, idx):
-        if 0 < i < len(high) - 1:
-            if high[i] > high[i-1] and high[i] > high[i+1]:
-                if np.isnan(best) or high[i] > best:
-                    best = high[i]
-    return best
+def swing_high(h, end, lb):
+    bp, bi = np.nan, -1
+    for i in range(max(1, end - lb), end - 1):
+        if h[i] > h[i-1] and h[i] > h[i+1]:
+            if np.isnan(bp) or h[i] > bp:
+                bp, bi = h[i], i
+    return bp, bi
 
 
-def find_swing_low(low: np.ndarray, idx: int, lookback: int) -> float:
-    if idx < lookback + 2:
-        return np.nan
-    best = np.nan
-    for i in range(idx - lookback, idx):
-        if 0 < i < len(low) - 1:
-            if low[i] < low[i-1] and low[i] < low[i+1]:
-                if np.isnan(best) or low[i] < best:
-                    best = low[i]
-    return best
+def swing_low(l, end, lb):
+    bp, bi = np.nan, -1
+    for i in range(max(1, end - lb), end - 1):
+        if l[i] < l[i-1] and l[i] < l[i+1]:
+            if np.isnan(bp) or l[i] < bp:
+                bp, bi = l[i], i
+    return bp, bi
 
 
-def detect_manipulation_up(high: np.ndarray, close: np.ndarray, idx: int,
-                           swing_high: float, lookback: int) -> bool:
-    if np.isnan(swing_high):
-        return False
-    s = max(0, idx - lookback)
-    for i in range(s, idx + 1):
-        if high[i] > swing_high and close[i] < swing_high:
+def swept_up(h1h, c1h, sh_p, from_bar, lb):
+    for k in range(from_bar, max(0, from_bar - lb), -1):
+        if h1h[k] > sh_p + SWEEP_MIN_WICK and c1h[k] < sh_p - SWEEP_MIN_BODY:
             return True
     return False
 
 
-def detect_manipulation_down(low: np.ndarray, close: np.ndarray, idx: int,
-                             swing_low: float, lookback: int) -> bool:
-    if np.isnan(swing_low):
-        return False
-    s = max(0, idx - lookback)
-    for i in range(s, idx + 1):
-        if low[i] < swing_low and close[i] > swing_low:
+def swept_down(l1h, c1h, sl_p, from_bar, lb):
+    for k in range(from_bar, max(0, from_bar - lb), -1):
+        if l1h[k] < sl_p - SWEEP_MIN_WICK and c1h[k] > sl_p + SWEEP_MIN_BODY:
             return True
     return False
 
 
-def detect_bos_bearish(close: np.ndarray, idx: int, swing_low: float,
-                       max_age: int) -> bool:
-    if np.isnan(swing_low):
-        return False
-    s = max(0, idx - max_age)
-    return bool(np.any(close[s:idx+1] < swing_low))
+def is_bos_bear(o15, c15, l15, bi, lb=BOS_NEW_LOW_LB):
+    if bi < lb: return False
+    if (o15[bi] - c15[bi]) < MIN_BOS_BODY: return False
+    return c15[bi] < np.min(l15[max(0, bi - lb):bi])
 
 
-def detect_bos_bullish(close: np.ndarray, idx: int, swing_high: float,
-                       max_age: int) -> bool:
-    if np.isnan(swing_high):
-        return False
-    s = max(0, idx - max_age)
-    return bool(np.any(close[s:idx+1] > swing_high))
+def is_bos_bull(o15, c15, h15, bi, lb=BOS_NEW_LOW_LB):
+    if bi < lb: return False
+    if (c15[bi] - o15[bi]) < MIN_BOS_BODY: return False
+    return c15[bi] > np.max(h15[max(0, bi - lb):bi])
 
 
-def detect_fvg_bearish(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-                       idx: int, lookback: int, min_pips: float):
-    """
-    Bearish FVG: bar A (i-1).low > bar C (i+1).high
-    Plus bar B (i) must be a strong bearish candle (body >= 3 pips).
-    Returns (fvg_high, fvg_low) of the most recent qualifying gap.
-    """
-    min_size = min_pips * PIP_SIZE
-    body_min = 3 * PIP_SIZE
-    s = max(1, idx - lookback)
-    for i in range(idx - 1, s, -1):
-        if i + 1 > idx:
-            continue
-        gap = l[i-1] - h[i+1]
-        if gap >= min_size:
-            body = o[i] - c[i]
-            if c[i] < o[i] and body >= body_min:
-                return l[i-1], h[i+1]
+def fvg_zone_bear(h15, l15, bos_i):
+    """FVG above current price after bearish BOS. Returns (zone_high, zone_low)."""
+    for a, c in [(bos_i-2, bos_i), (bos_i-3, bos_i-1)]:
+        if a < 0: continue
+        gap = l15[a] - h15[c]
+        if MIN_FVG_GAP <= gap <= MAX_FVG_GAP:
+            return l15[a], h15[c]
+    if bos_i >= 1:
+        gap = l15[bos_i-1] - h15[bos_i]
+        if MIN_FVG_GAP <= gap <= MAX_FVG_GAP:
+            return l15[bos_i-1], h15[bos_i]
     return np.nan, np.nan
 
 
-def detect_fvg_bullish(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-                       idx: int, lookback: int, min_pips: float):
-    """Bullish FVG: bar C (i+1).low > bar A (i-1).high"""
-    min_size = min_pips * PIP_SIZE
-    body_min = 3 * PIP_SIZE
-    s = max(1, idx - lookback)
-    for i in range(idx - 1, s, -1):
-        if i + 1 > idx:
-            continue
-        gap = l[i+1] - h[i-1]
-        if gap >= min_size:
-            body = c[i] - o[i]
-            if c[i] > o[i] and body >= body_min:
-                return l[i+1], h[i-1]
+def fvg_zone_bull(h15, l15, bos_i):
+    """FVG below current price after bullish BOS. Returns (zone_high, zone_low)."""
+    for a, c in [(bos_i-2, bos_i), (bos_i-3, bos_i-1)]:
+        if a < 0: continue
+        gap = l15[c] - h15[a]
+        if MIN_FVG_GAP <= gap <= MAX_FVG_GAP:
+            return l15[c], h15[a]
+    if bos_i >= 1:
+        gap = l15[bos_i] - h15[bos_i-1]
+        if MIN_FVG_GAP <= gap <= MAX_FVG_GAP:
+            return l15[bos_i], h15[bos_i-1]
     return np.nan, np.nan
 
 
-def detect_engulfing_bearish(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-                             idx: int, min_pips: float,
-                             zone_high: float = np.nan, zone_low: float = np.nan) -> bool:
-    """Strong bearish engulfing with optional FVG rejection check.
-       If zone given: candle high must reach into FVG and close below FVG low (rejection)."""
-    if idx < 1:
-        return False
-    cur_o, cur_c = o[idx], c[idx]
-    prev_o, prev_c = o[idx-1], c[idx-1]
-    if prev_c <= prev_o:
-        return False
-    body = cur_o - cur_c
-    if body < min_pips * PIP_SIZE:
-        return False
-    if not (cur_o >= prev_c and cur_c < prev_o):
-        return False
-    if not np.isnan(zone_high):
-        # Wick must have entered the FVG zone, close must reject below
-        if h[idx] < zone_low:        # never reached the zone
-            return False
-        if cur_c > zone_low:         # didn't close below the zone (no rejection)
-            return False
-    return True
+# ── Trade simulation ─────────────────────────────────────────────────────────
 
+def simulate(o5, h5, l5, c5, entry_i, direction):
+    ep  = o5[entry_i]
+    sld = SL_PIPS * PIP
+    tpd = TP_PIPS * PIP
+    sl  = ep + sld if direction == "sell" else ep - sld
+    tp  = ep - tpd if direction == "sell" else ep + tpd
+    be  = ep - sld if direction == "sell" else ep + sld
+    be_moved = False
 
-def detect_engulfing_bullish(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-                             idx: int, min_pips: float,
-                             zone_high: float = np.nan, zone_low: float = np.nan) -> bool:
-    if idx < 1:
-        return False
-    cur_o, cur_c = o[idx], c[idx]
-    prev_o, prev_c = o[idx-1], c[idx-1]
-    if prev_c >= prev_o:
-        return False
-    body = cur_c - cur_o
-    if body < min_pips * PIP_SIZE:
-        return False
-    if not (cur_o <= prev_c and cur_c > prev_o):
-        return False
-    if not np.isnan(zone_high):
-        if l[idx] > zone_high:       # never reached the zone
-            return False
-        if cur_c < zone_high:        # didn't close above the zone
-            return False
-    return True
-
-
-def in_zone(price: float, zone_high: float, zone_low: float) -> bool:
-    if np.isnan(zone_high):
-        return False
-    return zone_low <= price <= zone_high
-
-
-# ---------------------------------------------------------------------------
-# Setup detection — receive arrays + current indices
-# ---------------------------------------------------------------------------
-
-def check_setup1(o5, h5, l5, c5, i5,
-                 o15, h15, l15, c15, i15,
-                 o1h, h1h, l1h, c1h, i1h):
-    # ---- SELL ----
-    sh1h = find_swing_high(h1h, i1h, SWING_LB)
-    if not np.isnan(sh1h):
-        if detect_manipulation_up(h1h, c1h, i1h, sh1h, MAN_LB):
-            sl15 = find_swing_low(l15, i15, SWING_LB)
-            if detect_bos_bearish(c15, i15, sl15, BOS_MAX_AGE):
-                fvg_h, fvg_l = detect_fvg_bearish(o15, h15, l15, c15, i15, FVG_LB, MIN_FVG_PIPS)
-                if not np.isnan(fvg_h):
-                    if in_zone(c5[i5], fvg_h, fvg_l) or in_zone(h5[i5], fvg_h, fvg_l):
-                        if detect_engulfing_bearish(o5, h5, l5, c5, i5, MIN_ENGULF_PIPS, fvg_h, fvg_l):
-                            return "sell"
-    # ---- BUY ----
-    sl1h = find_swing_low(l1h, i1h, SWING_LB)
-    if not np.isnan(sl1h):
-        if detect_manipulation_down(l1h, c1h, i1h, sl1h, MAN_LB):
-            sh15 = find_swing_high(h15, i15, SWING_LB)
-            if detect_bos_bullish(c15, i15, sh15, BOS_MAX_AGE):
-                fvg_h, fvg_l = detect_fvg_bullish(o15, h15, l15, c15, i15, FVG_LB, MIN_FVG_PIPS)
-                if not np.isnan(fvg_h):
-                    if in_zone(c5[i5], fvg_h, fvg_l) or in_zone(l5[i5], fvg_h, fvg_l):
-                        if detect_engulfing_bullish(o5, h5, l5, c5, i5, MIN_ENGULF_PIPS, fvg_h, fvg_l):
-                            return "buy"
-    return None
-
-
-def check_setup2(o5, h5, l5, c5, i5,
-                 o15, h15, l15, c15, i15,
-                 o1h, h1h, l1h, c1h, i1h):
-    # ---- SELL ----
-    f1h_h, f1h_l = detect_fvg_bearish(o1h, h1h, l1h, c1h, i1h, FVG_LB, MIN_FVG_PIPS)
-    if not np.isnan(f1h_h):
-        f15_h, f15_l = detect_fvg_bearish(o15, h15, l15, c15, i15, FVG_LB * 4, MIN_FVG_PIPS)
-        if not np.isnan(f15_h) and f15_h <= f1h_h + 5 * PIP_SIZE:
-            if in_zone(c5[i5], f1h_h, f1h_l) or in_zone(h5[i5], f1h_h, f1h_l):
-                if detect_engulfing_bearish(o5, h5, l5, c5, i5, MIN_ENGULF_PIPS, f1h_h, f1h_l):
-                    return "sell"
-    # ---- BUY ----
-    f1h_h, f1h_l = detect_fvg_bullish(o1h, h1h, l1h, c1h, i1h, FVG_LB, MIN_FVG_PIPS)
-    if not np.isnan(f1h_h):
-        f15_h, f15_l = detect_fvg_bullish(o15, h15, l15, c15, i15, FVG_LB * 4, MIN_FVG_PIPS)
-        if not np.isnan(f15_h) and f15_l >= f1h_l - 5 * PIP_SIZE:
-            if in_zone(c5[i5], f1h_h, f1h_l) or in_zone(l5[i5], f1h_h, f1h_l):
-                if detect_engulfing_bullish(o5, h5, l5, c5, i5, MIN_ENGULF_PIPS, f1h_h, f1h_l):
-                    return "buy"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Lot size + trade simulation
-# ---------------------------------------------------------------------------
-
-def calc_lot_size(equity: float, sl_pips: int) -> float:
-    risk_amount = equity * RISK_PCT
-    pip_value   = 10.0   # USD/pip per lot for EURUSD
-    lots = risk_amount / (sl_pips * pip_value)
-    return round(max(0.01, lots), 2)
-
-
-def simulate_trade(h5, l5, c5, t5, entry_idx: int, direction: str):
-    entry_price = c5[entry_idx]
-    sl_d = SL_PIPS * PIP_SIZE
-    tp_d = TP_PIPS * PIP_SIZE
-    if direction == "sell":
-        sl_p, tp_p = entry_price + sl_d, entry_price - tp_d
-    else:
-        sl_p, tp_p = entry_price - sl_d, entry_price + tp_d
-
-    end = min(entry_idx + 500, len(c5))
-    for j in range(entry_idx + 1, end):
+    for j in range(entry_i, min(entry_i + 700, len(c5))):
+        if not be_moved:
+            if direction == "sell" and l5[j] <= be:
+                sl = ep - PIP; be_moved = True
+            elif direction == "buy" and h5[j] >= be:
+                sl = ep + PIP; be_moved = True
         if direction == "sell":
-            if h5[j] >= sl_p:
-                return {"result": "loss", "exit_time": t5[j], "entry": entry_price,
-                        "exit": sl_p, "pips": -SL_PIPS, "exit_idx": j}
-            if l5[j] <= tp_p:
-                return {"result": "win", "exit_time": t5[j], "entry": entry_price,
-                        "exit": tp_p, "pips": TP_PIPS, "exit_idx": j}
+            if h5[j] >= sl:
+                return dict(result="be" if be_moved else "loss",
+                            exit_i=j, pips=0 if be_moved else -SL_PIPS)
+            if l5[j] <= tp:
+                return dict(result="win", exit_i=j, pips=TP_PIPS)
         else:
-            if l5[j] <= sl_p:
-                return {"result": "loss", "exit_time": t5[j], "entry": entry_price,
-                        "exit": sl_p, "pips": -SL_PIPS, "exit_idx": j}
-            if h5[j] >= tp_p:
-                return {"result": "win", "exit_time": t5[j], "entry": entry_price,
-                        "exit": tp_p, "pips": TP_PIPS, "exit_idx": j}
-    return {"result": "timeout", "exit_time": t5[end-1], "entry": entry_price,
-            "exit": entry_price, "pips": 0, "exit_idx": end-1}
+            if l5[j] <= sl:
+                return dict(result="be" if be_moved else "loss",
+                            exit_i=j, pips=0 if be_moved else -SL_PIPS)
+            if h5[j] >= tp:
+                return dict(result="win", exit_i=j, pips=TP_PIPS)
+
+    return dict(result="timeout", exit_i=min(entry_i + 699, len(c5) - 1), pips=0)
 
 
-# ---------------------------------------------------------------------------
-# Main backtest loop
-# ---------------------------------------------------------------------------
+def lot_size(eq):
+    return round(max(0.01, eq * RISK_PCT / 100 / (SL_PIPS * 10)), 2)
+
+
+# ── Main backtest loop ────────────────────────────────────────────────────────
 
 def run_backtest():
-    print("Loading data...")
+    print("Loading data…")
     df5  = load_5m()
-    df15 = load_htf("ohlc_15m.csv")
-    df1h = load_htf("ohlc_1h.csv")
+    df15 = load_ohlc("ohlc_15m.csv")
+    df1h = load_ohlc("ohlc_1h.csv")
 
-    start = max(df5["time"].iloc[0], df15["time"].iloc[0], df1h["time"].iloc[0])
-    end   = min(df5["time"].iloc[-1], df15["time"].iloc[-1], df1h["time"].iloc[-1])
-    df5  = df5[(df5["time"]  >= start) & (df5["time"]  <= end)].reset_index(drop=True)
-    df15 = df15[(df15["time"] >= start) & (df15["time"] <= end)].reset_index(drop=True)
-    df1h = df1h[(df1h["time"] >= start) & (df1h["time"] <= end)].reset_index(drop=True)
+    t0 = max(df5.time.iat[0],  df15.time.iat[0],  df1h.time.iat[0])
+    t1 = min(df5.time.iat[-1], df15.time.iat[-1], df1h.time.iat[-1])
+    df5  = df5 [(df5.time  >= t0) & (df5.time  <= t1)].reset_index(drop=True)
+    df15 = df15[(df15.time >= t0) & (df15.time <= t1)].reset_index(drop=True)
+    df1h = df1h[(df1h.time >= t0) & (df1h.time <= t1)].reset_index(drop=True)
+    print(f"Range: {t0.date()} → {t1.date()}  |  "
+          f"5M:{len(df5)}  15M:{len(df15)}  1H:{len(df1h)}")
 
-    print(f"Backtest range: {start.date()} → {end.date()}")
-    print(f"5M bars: {len(df5)} | 15M bars: {len(df15)} | 1H bars: {len(df1h)}")
+    t5  = df5.time.values;   o5  = df5.open.values;  h5  = df5.high.values
+    l5  = df5.low.values;    c5  = df5.close.values
+    t15 = df15.time.values;  o15 = df15.open.values; h15 = df15.high.values
+    l15 = df15.low.values;   c15 = df15.close.values
+    t1h = df1h.time.values;  h1h = df1h.high.values; l1h = df1h.low.values
+    c1h = df1h.close.values
 
-    # Numpy arrays
-    o5, h5, l5, c5 = df5["open"].values, df5["high"].values, df5["low"].values, df5["close"].values
-    o15, h15, l15, c15 = df15["open"].values, df15["high"].values, df15["low"].values, df15["close"].values
-    o1h, h1h, l1h, c1h = df1h["open"].values, df1h["high"].values, df1h["low"].values, df1h["close"].values
-    t5 = df5["time"].values
-    t15 = df15["time"].values
-    t1h = df1h["time"].values
+    utc_hours = np.array([pd.Timestamp(t, tz="UTC").hour for t in t5])
 
-    # Session mask on 5M
-    sess_mask = in_session_mask(pd.DatetimeIndex(df5["time"]))
+    equity = INIT_BAL; peak = INIT_BAL; eq_curve = [INIT_BAL]; trades = []
+    day = None; day_eq = INIT_BAL; halted = False
+    traded_london = False; traded_ny = False   # one trade per session, not per day
+    setup  = None
+    i15 = 0; i1h = 0; prev_i15 = -1; skip_until = 0
 
-    print("Running backtest…")
-    trades = []
-    equity = INIT_BAL
-    eq_curve = [equity]
-    last_trade_end_idx = 0
-    last_signal_idx    = -COOLDOWN_BARS
-
-    min_5m, min_15m, min_1h = 60, 60, 30
-    i15 = 0
-    i1h = 0
-    n5 = len(df5)
-
-    for i in range(min_5m, n5):
-        if i <= last_trade_end_idx:
-            continue
-        if i - last_signal_idx < COOLDOWN_BARS:
-            continue
-        if not sess_mask[i]:
+    for i5 in range(300, len(t5)):
+        if i5 < skip_until:
             continue
 
-        bar_t = t5[i]
-        # Advance HTF cursors
-        while i15 + 1 < len(t15) and t15[i15 + 1] <= bar_t:
+        utc_h = utc_hours[i5]
+        if   LONDON_UTC_START <= utc_h < LONDON_UTC_END: sess = "london"
+        elif NY_UTC_START     <= utc_h < NY_UTC_END:     sess = "ny"
+        else:                                             sess = None
+
+        d = pd.Timestamp(t5[i5], tz="UTC").date()
+        if d != day:
+            day = d; day_eq = equity; halted = False
+            traded_london = False; traded_ny = False
+
+        peak = max(peak, equity)
+        if (peak - equity) / peak >= MAX_DD:
+            continue
+        if not halted and day_eq > 0 and (day_eq - equity) / day_eq >= DAILY_LOSS:
+            halted = True
+        if halted:
+            continue
+
+        # Block session if already traded it today
+        if sess == "london" and traded_london:
+            continue
+        if sess == "ny" and traded_ny:
+            continue
+
+        while i15 + 1 < len(t15) and t15[i15 + 1] <= t5[i5]:
             i15 += 1
-        while i1h + 1 < len(t1h) and t1h[i1h + 1] <= bar_t:
+        while i1h + 1 < len(t1h) and t1h[i1h + 1] <= t5[i5]:
             i1h += 1
-        if i15 < min_15m or i1h < min_1h:
+        if i1h < SWING_LB_1H + 2 or i15 < BOS_NEW_LOW_LB + 4:
             continue
 
-        # i in 5M is the CURRENT bar — use i-1 as last closed bar
-        i5_closed = i - 1
+        new_15 = (i15 != prev_i15)
+        prev_i15 = i15
 
-        direction = check_setup1(o5, h5, l5, c5, i5_closed,
-                                 o15, h15, l15, c15, i15,
-                                 o1h, h1h, l1h, c1h, i1h)
-        setup_id = "setup1"
-        if direction is None:
-            direction = check_setup2(o5, h5, l5, c5, i5_closed,
-                                     o15, h15, l15, c15, i15,
-                                     o1h, h1h, l1h, c1h, i1h)
-            setup_id = "setup2"
-        if direction is None:
+        # ── A: Setup detection ────────────────────────────────────────────
+        if new_15 and setup is None:
+
+            # Sell setup: bearish BOS + prior 1H sweep up → zone ABOVE price
+            if is_bos_bear(o15, c15, l15, i15):
+                sh1h_p, _ = swing_high(h1h, i1h, SWING_LB_1H)
+                if not np.isnan(sh1h_p) and swept_up(h1h, c1h, sh1h_p, i1h, SWING_LB_1H):
+                    zh, zl = fvg_zone_bear(h15, l15, i15)
+                    if not np.isnan(zh) and zl > c15[i15]:
+                        setup = dict(direction="sell", zone_h=zh, zone_l=zl,
+                                     expiry_i5=i5 + ZONE_EXPIRY_5M, source="sell_sweep")
+
+            # Buy setup: bullish BOS + prior 1H sweep down → zone BELOW price
+            if setup is None and is_bos_bull(o15, c15, h15, i15):
+                sl1h_p, _ = swing_low(l1h, i1h, SWING_LB_1H)
+                if not np.isnan(sl1h_p) and swept_down(l1h, c1h, sl1h_p, i1h, SWING_LB_1H):
+                    zh, zl = fvg_zone_bull(h15, l15, i15)
+                    if not np.isnan(zh) and zh < c15[i15]:
+                        setup = dict(direction="buy", zone_h=zh, zone_l=zl,
+                                     expiry_i5=i5 + ZONE_EXPIRY_5M, source="buy_sweep")
+
+        # ── B: Zone management ────────────────────────────────────────────
+        if setup:
+            if i5 >= setup["expiry_i5"]:
+                setup = None
+            # Blown: price closed too far through the zone
+            elif setup["direction"] == "sell" and c5[i5-1] > setup["zone_h"] + ZONE_BLOWN_PIPS * PIP:
+                setup = None
+            elif setup["direction"] == "buy"  and c5[i5-1] < setup["zone_l"] - ZONE_BLOWN_PIPS * PIP:
+                setup = None
+
+        # ── C: Entry — simple zone touch, no engulfing required ──────────
+        if sess is None or setup is None:
             continue
 
-        lots = calc_lot_size(equity, SL_PIPS)
-        result = simulate_trade(h5, l5, c5, t5, i, direction)
-        result["setup"]      = setup_id
-        result["direction"]  = direction
-        result["entry_time"] = bar_t
-        result["lots"]       = lots
-        pnl = result["pips"] * lots * 10.0
+        # Sell setups only taken in NY — London sells have shown 0% WR empirically
+        if setup["direction"] == "sell" and sess != "ny":
+            continue
+
+        entered = False
+        if setup["direction"] == "sell":
+            # High touched zone_l (zone bottom), close not blown through zone_h (zone top)
+            if h5[i5-1] >= setup["zone_l"] and c5[i5-1] <= setup["zone_h"] + ZONE_BLOWN_PIPS * PIP:
+                entered = True
+        else:  # buy
+            # Low touched zone_h (zone top), close not blown through zone_l (zone bottom)
+            if l5[i5-1] <= setup["zone_h"] and c5[i5-1] >= setup["zone_l"] - ZONE_BLOWN_PIPS * PIP:
+                entered = True
+
+        if not entered:
+            continue
+
+        # ── Fire trade ────────────────────────────────────────────────────
+        lots = lot_size(equity)
+        res  = simulate(o5, h5, l5, c5, i5, setup["direction"])
+        pnl  = res["pips"] * lots * 10.0
         equity += pnl
-        result["pnl"]    = round(pnl, 2)
-        result["equity"] = round(equity, 2)
-        trades.append(result)
         eq_curve.append(equity)
-        last_signal_idx    = i
-        last_trade_end_idx = result["exit_idx"]
 
-        if len(trades) % 20 == 0:
-            print(f"  {len(trades)} trades | equity: ${equity:,.2f}")
+        trades.append(dict(
+            result     = res["result"],
+            direction  = setup["direction"],
+            source     = setup["source"],
+            session    = sess,
+            entry_time = pd.Timestamp(t5[i5],           tz="UTC").isoformat(),
+            exit_time  = pd.Timestamp(t5[res["exit_i"]], tz="UTC").isoformat(),
+            pips       = res["pips"],
+            lots       = lots,
+            pnl        = round(pnl, 2),
+            equity     = round(equity, 2),
+            month      = str(pd.Timestamp(t5[i5], tz="UTC").to_period("M")),
+        ))
 
-    print(f"\nBacktest complete: {len(trades)} trades | final equity: ${equity:,.2f}")
+        setup = None
+        if sess == "london": traded_london = True
+        if sess == "ny":     traded_ny = True
+        skip_until = res["exit_i"] + 1
+
+        n = len(trades)
+        if n % 5 == 0:
+            wins = sum(1 for t in trades if t["result"] == "win")
+            print(f"  {n} trades  WR {wins/n*100:.0f}%  equity ${equity:,.0f}")
+
+    n = len(trades)
+    if n:
+        wins = sum(1 for t in trades if t["result"] == "win")
+        print(f"\nDone: {n} trades  |  WR {wins/n*100:.1f}%  equity ${equity:,.0f}")
+    else:
+        print("\nDone: 0 trades")
     return pd.DataFrame(trades), eq_curve
 
 
 if __name__ == "__main__":
     from report import generate_report
-    trades_df, eq = run_backtest()
-    generate_report(trades_df, eq)
+    df_t, eq = run_backtest()
+    generate_report(df_t, eq)
